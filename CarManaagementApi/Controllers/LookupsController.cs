@@ -1,8 +1,9 @@
 using CarManaagementApi.Contracts;
-using CarManaagementApi.Services;
+using CarManaagementApi.Persistence;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace CarManaagementApi.Controllers;
 
@@ -11,24 +12,22 @@ namespace CarManaagementApi.Controllers;
 [Route("api/v1/lookups")]
 public class LookupsController : ApiControllerBase
 {
-    private readonly IRentXStore _store;
+    private readonly RentXDbContext _db;
 
-    public LookupsController(IRentXStore store)
+    public LookupsController(RentXDbContext db)
     {
-        _store = store;
+        _db = db;
     }
 
     [HttpGet("branches")]
-    public IActionResult GetBranches()
+    public async Task<IActionResult> GetBranches()
     {
-        List<object> branches;
-        lock (_store.SyncRoot)
-        {
-            branches = _store.Branches
-                .Where(x => x.Active)
-                .Select(x => (object)new { code = x.Id, name = x.Name })
-                .ToList();
-        }
+        var branches = await _db.Branches
+            .AsNoTracking()
+            .Where(x => x.IsActive)
+            .OrderBy(x => x.Name)
+            .Select(x => (object)new { code = x.BranchId, name = x.Name })
+            .ToListAsync();
 
         return OkResponse<IEnumerable<object>>(branches);
     }

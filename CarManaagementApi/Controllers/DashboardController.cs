@@ -1,7 +1,8 @@
-using CarManaagementApi.Services;
+using CarManaagementApi.Persistence;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace CarManaagementApi.Controllers;
 
@@ -10,15 +11,15 @@ namespace CarManaagementApi.Controllers;
 [Route("api/v1/dashboard")]
 public class DashboardController : ApiControllerBase
 {
-    private readonly IRentXStore _store;
+    private readonly RentXDbContext _db;
 
-    public DashboardController(IRentXStore store)
+    public DashboardController(RentXDbContext db)
     {
-        _store = store;
+        _db = db;
     }
 
     [HttpGet("summary")]
-    public IActionResult GetSummary(
+    public async Task<IActionResult> GetSummary(
         [FromQuery] DateTime? from,
         [FromQuery] DateTime? to,
         [FromQuery] string? branchCodes)
@@ -26,188 +27,198 @@ public class DashboardController : ApiControllerBase
         var today = DateTime.UtcNow.Date;
         var branches = SplitCsv(branchCodes);
 
-        lock (_store.SyncRoot)
+        var query = _db.Bookings.AsNoTracking().AsQueryable();
+
+        if (from.HasValue)
         {
-            var filtered = _store.Bookings.AsEnumerable();
-            if (from.HasValue)
-            {
-                filtered = filtered.Where(x => x.PickAt >= from.Value);
-            }
-
-            if (to.HasValue)
-            {
-                filtered = filtered.Where(x => x.DropAt <= to.Value);
-            }
-
-            if (branches.Count > 0)
-            {
-                filtered = filtered.Where(x => branches.Contains(x.LocationCode, StringComparer.OrdinalIgnoreCase));
-            }
-
-            var filteredList = filtered.ToList();
-            var totalRevenueToday = filteredList
-                .Where(x => x.PickAt.Date == today && x.Status is "approved" or "ongoing" or "completed")
-                .Sum(x => x.DailyPrice * x.Days);
-            var activeRentals = filteredList.Count(x => x.Status == "ongoing");
-            var newBookings = filteredList.Count(x => x.CreatedAt.Date == today);
-            var activeCars = _store.Cars.Count(x => x.Active);
-            var utilizedCars = filteredList
-                .Where(x => x.Status is "approved" or "ongoing")
-                .Select(x => x.CarId)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Count();
-
-            var fleetUtilizationPercent = activeCars == 0 ? 0 : (int)Math.Round((double)utilizedCars * 100 / activeCars, MidpointRounding.AwayFromZero);
-
-            return OkResponse(new
-            {
-                totalRevenueToday,
-                activeRentals,
-                newBookings,
-                fleetUtilizationPercent
-            });
+            query = query.Where(x => x.PickAt >= from.Value);
         }
+
+        if (to.HasValue)
+        {
+            query = query.Where(x => x.DropAt <= to.Value);
+        }
+
+        if (branches.Count > 0)
+        {
+            query = query.Where(x => branches.Contains(x.LocationCode));
+        }
+
+        var bookings = await query.ToListAsync();
+        var totalRevenueToday = bookings
+            .Where(x => x.PickAt.Date == today && (x.Status == "approved" || x.Status == "ongoing" || x.Status == "completed"))
+            .Sum(x => x.DailyPrice * x.Days);
+        var activeRentals = bookings.Count(x => x.Status == "ongoing");
+        var newBookings = bookings.Count(x => x.CreatedAt.Date == today);
+
+        var activeCars = await _db.Cars.CountAsync(x => x.IsActive);
+        var utilizedCars = bookings
+            .Where(x => x.Status == "approved" || x.Status == "ongoing")
+            .Select(x => x.CarId)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+
+        var fleetUtilizationPercent = activeCars == 0 ? 0 : (int)Math.Round((double)utilizedCars * 100 / activeCars, MidpointRounding.AwayFromZero);
+
+        return OkResponse(new
+        {
+            totalRevenueToday,
+            activeRentals,
+            newBookings,
+            fleetUtilizationPercent
+        });
     }
 
     [HttpGet("fleet-by-location")]
-    public IActionResult GetFleetByLocation()
+    public async Task<IActionResult> GetFleetByLocation()
     {
-        lock (_store.SyncRoot)
+        var branches = await _db.Branches.AsNoTracking().OrderBy(x => x.Name).ToListAsync();
+        var cars = await _db.Cars.AsNoTracking().Where(x => x.IsActive).ToListAsync();
+        var activeBookingCarIds = await _db.Bookings
+            .AsNoTracking()
+            .Where(x => x.Status == "approved" || x.Status == "ongoing")
+            .Select(x => x.CarId)
+            .Distinct()
+            .ToListAsync();
+
+        var activeSet = activeBookingCarIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var data = branches.Select(branch =>
         {
-            var activeBookingCarIds = _store.Bookings
-                .Where(x => x.Status is "approved" or "ongoing")
-                .Select(x => x.CarId)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-            var data = _store.Branches.Select(branch =>
+            var carsAtBranch = cars.Where(x => x.BranchId.Equals(branch.BranchId, StringComparison.OrdinalIgnoreCase)).ToList();
+            var used = carsAtBranch.Count(x => activeSet.Contains(x.CarId));
+            var total = carsAtBranch.Count;
+            return (object)new
             {
-                var carsAtBranch = _store.Cars.Where(x => x.BranchId.Equals(branch.Id, StringComparison.OrdinalIgnoreCase) && x.Active).ToList();
-                var used = carsAtBranch.Count(x => activeBookingCarIds.Contains(x.Id));
-                var total = carsAtBranch.Count;
-                return (object)new
-                {
-                    locationName = branch.Name,
-                    used,
-                    total
-                };
-            }).ToList();
+                locationName = branch.Name,
+                used,
+                total
+            };
+        }).ToList();
 
-            return OkResponse<IEnumerable<object>>(data);
-        }
+        return OkResponse<IEnumerable<object>>(data);
     }
 
     [HttpGet("revenue-trend")]
-    public IActionResult GetRevenueTrend([FromQuery] int days = 7)
+    public async Task<IActionResult> GetRevenueTrend([FromQuery] int days = 7)
     {
         var safeDays = days <= 0 ? 7 : Math.Min(days, 60);
         var start = DateTime.UtcNow.Date.AddDays(-safeDays + 1);
 
-        lock (_store.SyncRoot)
-        {
-            var points = Enumerable.Range(0, safeDays)
-                .Select(offset =>
-                {
-                    var day = start.AddDays(offset);
-                    var total = _store.Bookings
-                        .Where(x => x.PickAt.Date == day && x.Status is "approved" or "ongoing" or "completed")
-                        .Sum(x => x.DailyPrice * x.Days);
-                    return (int)total;
-                })
-                .ToList();
+        var bookings = await _db.Bookings
+            .AsNoTracking()
+            .Where(x => x.PickAt >= start && (x.Status == "approved" || x.Status == "ongoing" || x.Status == "completed"))
+            .ToListAsync();
 
-            return OkResponse(new { days = safeDays, points });
-        }
+        var points = Enumerable.Range(0, safeDays)
+            .Select(offset =>
+            {
+                var day = start.AddDays(offset);
+                var total = bookings
+                    .Where(x => x.PickAt.Date == day)
+                    .Sum(x => x.DailyPrice * x.Days);
+                return (int)total;
+            })
+            .ToList();
+
+        return OkResponse(new { days = safeDays, points });
     }
 
     [HttpGet("recent-bookings")]
-    public IActionResult GetRecentBookings([FromQuery] int limit = 10)
+    public async Task<IActionResult> GetRecentBookings([FromQuery] int limit = 10)
     {
         var safeLimit = limit <= 0 ? 10 : Math.Min(limit, 100);
 
-        lock (_store.SyncRoot)
-        {
-            var data = _store.Bookings
-                .OrderByDescending(x => x.CreatedAt)
-                .Take(safeLimit)
-                .Select(x => (object)new
-                {
-                    id = x.Id,
-                    pickAt = x.PickAt,
-                    dropAt = x.DropAt,
-                    locationCode = x.LocationCode,
-                    customerName = x.CustomerName,
-                    carName = x.CarName,
-                    status = x.Status,
-                    days = x.Days,
-                    dailyPrice = x.DailyPrice
-                })
-                .ToList();
+        var data = await _db.Bookings
+            .AsNoTracking()
+            .Include(x => x.Customer)
+            .Include(x => x.Car)
+            .OrderByDescending(x => x.CreatedAt)
+            .Take(safeLimit)
+            .Select(x => (object)new
+            {
+                id = x.BookingId,
+                pickAt = x.PickAt,
+                dropAt = x.DropAt,
+                locationCode = x.LocationCode,
+                customerName = x.Customer.Name,
+                carName = x.Car.Brand + " " + x.Car.Model,
+                status = x.Status,
+                days = x.Days,
+                dailyPrice = x.DailyPrice
+            })
+            .ToListAsync();
 
-            return OkResponse<IEnumerable<object>>(data);
-        }
+        return OkResponse<IEnumerable<object>>(data);
     }
 
     [HttpGet("activity-timeline")]
-    public IActionResult GetActivityTimeline([FromQuery] int limit = 20)
+    public async Task<IActionResult> GetActivityTimeline([FromQuery] int limit = 20)
     {
         var safeLimit = limit <= 0 ? 20 : Math.Min(limit, 100);
 
-        lock (_store.SyncRoot)
-        {
-            var bookingEvents = _store.Bookings.Select(x => new
+        var bookingEvents = await _db.Bookings
+            .AsNoTracking()
+            .OrderByDescending(x => x.CreatedAt)
+            .Take(safeLimit)
+            .Select(x => new
             {
                 occurredAt = x.CreatedAt,
-                label = $"Booking {x.Id} created",
+                label = "Booking " + x.BookingId + " created",
                 type = "booking"
-            });
+            })
+            .ToListAsync();
 
-            var maintenanceEvents = _store.MaintenanceBlocks.Select(x => new
+        var maintenanceEvents = await _db.MaintenanceBlocks
+            .AsNoTracking()
+            .OrderByDescending(x => x.BlockFrom)
+            .Take(safeLimit)
+            .Select(x => new
             {
-                occurredAt = x.From.ToDateTime(new TimeOnly(0, 0), DateTimeKind.Utc),
-                label = $"Maintenance {x.Id} scheduled for {x.CarId}",
+                occurredAt = x.CreatedAt,
+                label = "Maintenance " + x.MaintenanceId + " scheduled for " + x.CarId,
                 type = "maintenance"
-            });
+            })
+            .ToListAsync();
 
-            var data = bookingEvents
-                .Concat(maintenanceEvents)
-                .OrderByDescending(x => x.occurredAt)
-                .Take(safeLimit)
-                .Cast<object>()
-                .ToList();
+        var data = bookingEvents
+            .Concat(maintenanceEvents)
+            .OrderByDescending(x => x.occurredAt)
+            .Take(safeLimit)
+            .Cast<object>()
+            .ToList();
 
-            return OkResponse<IEnumerable<object>>(data);
-        }
+        return OkResponse<IEnumerable<object>>(data);
     }
 
     [HttpGet("fleet-health")]
-    public IActionResult GetFleetHealth()
+    public async Task<IActionResult> GetFleetHealth()
     {
-        lock (_store.SyncRoot)
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var totalCars = await _db.Cars.CountAsync(x => x.IsActive);
+        var blockedCars = await _db.MaintenanceBlocks
+            .Where(x => x.BlockFrom <= today && x.BlockTo >= today)
+            .Select(x => x.CarId)
+            .Distinct()
+            .CountAsync();
+
+        var readyPercent = totalCars == 0 ? 100 : Math.Max(0, 100 - (int)Math.Round((double)blockedCars * 100 / totalCars));
+
+        var serviceDueSoon = await _db.MaintenanceBlocks.CountAsync(x => x.BlockFrom <= DateOnly.FromDateTime(DateTime.UtcNow.AddDays(10)));
+        var criticalAlerts = await _db.MaintenanceBlocks.CountAsync(x => x.MaintenanceType == "repair");
+
+        var score = Math.Max(0, Math.Min(100, (readyPercent + (100 - Math.Min(100, serviceDueSoon * 5)) + (100 - Math.Min(100, criticalAlerts * 10))) / 3));
+
+        return OkResponse(new
         {
-            var totalCars = _store.Cars.Count(x => x.Active);
-            var blockedCars = _store.MaintenanceBlocks
-                .Where(x => x.From <= DateOnly.FromDateTime(DateTime.UtcNow) && x.To >= DateOnly.FromDateTime(DateTime.UtcNow))
-                .Select(x => x.CarId)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Count();
-
-            var readyPercent = totalCars == 0 ? 100 : Math.Max(0, 100 - (int)Math.Round((double)blockedCars * 100 / totalCars));
-            var serviceDueSoon = _store.MaintenanceBlocks.Count(x => x.From <= DateOnly.FromDateTime(DateTime.UtcNow.AddDays(10)));
-            var criticalAlerts = _store.MaintenanceBlocks.Count(x => x.Type == "repair");
-
-            var score = Math.Max(0, Math.Min(100, (readyPercent + (100 - Math.Min(100, serviceDueSoon * 5)) + (100 - Math.Min(100, criticalAlerts * 10))) / 3));
-
-            return OkResponse(new
+            score,
+            metrics = new object[]
             {
-                score,
-                metrics = new object[]
-                {
-                    new { label = "Ready for dispatch", value = readyPercent, tone = "good" },
-                    new { label = "Service due soon", value = serviceDueSoon, tone = "warn" },
-                    new { label = "Critical alerts", value = criticalAlerts, tone = "risk" }
-                }
-            });
-        }
+                new { label = "Ready for dispatch", value = readyPercent, tone = "good" },
+                new { label = "Service due soon", value = serviceDueSoon, tone = "warn" },
+                new { label = "Critical alerts", value = criticalAlerts, tone = "risk" }
+            }
+        });
     }
 
     private static List<string> SplitCsv(string? value)

@@ -1,7 +1,8 @@
-using CarManaagementApi.Services;
+using CarManaagementApi.Persistence;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace CarManaagementApi.Controllers;
 
@@ -10,15 +11,15 @@ namespace CarManaagementApi.Controllers;
 [Route("api/v1/me")]
 public class MeController : ApiControllerBase
 {
-    private readonly IRentXStore _store;
+    private readonly RentXDbContext _db;
 
-    public MeController(IRentXStore store)
+    public MeController(RentXDbContext db)
     {
-        _store = store;
+        _db = db;
     }
 
     [HttpGet("profile")]
-    public IActionResult GetProfile()
+    public async Task<IActionResult> GetProfile()
     {
         var userId = User.GetUserId();
         if (string.IsNullOrWhiteSpace(userId))
@@ -26,19 +27,17 @@ public class MeController : ApiControllerBase
             return ErrorResponse(StatusCodes.Status401Unauthorized, "Unauthorized");
         }
 
-        lock (_store.SyncRoot)
+        var user = await _db.Users.AsNoTracking().FirstOrDefaultAsync(x => x.UserId == userId);
+        if (user is null)
         {
-            if (!_store.ProfilesByUserId.TryGetValue(userId, out var profile))
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Profile not found");
-            }
-
-            return OkResponse(ToResponse(profile));
+            return ErrorResponse(StatusCodes.Status404NotFound, "Profile not found");
         }
+
+        return OkResponse(ToResponse(user));
     }
 
     [HttpPut("profile")]
-    public IActionResult UpdateProfile(ProfileUpsertRequest request)
+    public async Task<IActionResult> UpdateProfile(ProfileUpsertRequest request)
     {
         var userId = User.GetUserId();
         if (string.IsNullOrWhiteSpace(userId))
@@ -46,42 +45,25 @@ public class MeController : ApiControllerBase
             return ErrorResponse(StatusCodes.Status401Unauthorized, "Unauthorized");
         }
 
-        lock (_store.SyncRoot)
+        var user = await _db.Users.FirstOrDefaultAsync(x => x.UserId == userId);
+        if (user is null)
         {
-            if (!_store.ProfilesByUserId.TryGetValue(userId, out var profile))
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Profile not found");
-            }
-
-            profile.FullName = request.FullName;
-            profile.Username = request.Username;
-            profile.Email = request.Email;
-            profile.Phone = request.Phone;
-            profile.Gender = request.Gender;
-            profile.Dob = request.Dob;
-            profile.Address = request.Address;
-            profile.City = request.City;
-            profile.State = request.State;
-            profile.Pincode = request.Pincode;
-            profile.NotifEmail = request.NotifEmail;
-            profile.NotifSms = request.NotifSms;
-            profile.NotifWhatsApp = request.NotifWhatsApp;
-
-            var user = _store.Users.FirstOrDefault(x => x.Id == userId);
-            if (user is not null)
-            {
-                user.Name = request.FullName;
-                user.Username = request.Username;
-                user.Email = request.Email;
-                user.Phone = request.Phone;
-            }
-
-            return OkResponse(ToResponse(profile), "Profile updated");
+            return ErrorResponse(StatusCodes.Status404NotFound, "Profile not found");
         }
+
+        user.FullName = request.FullName;
+        user.Username = request.Username;
+        user.Email = request.Email;
+        user.Phone = request.Phone;
+        user.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+
+        return OkResponse(ToResponse(user), "Profile updated");
     }
 
     [HttpPut("password")]
-    public IActionResult ChangePassword(ChangePasswordRequest request)
+    public async Task<IActionResult> ChangePassword(ChangePasswordRequest request)
     {
         if (!string.Equals(request.NewPassword, request.ConfirmPassword, StringComparison.Ordinal))
         {
@@ -96,26 +78,27 @@ public class MeController : ApiControllerBase
             return ErrorResponse(StatusCodes.Status401Unauthorized, "Unauthorized");
         }
 
-        lock (_store.SyncRoot)
+        var user = await _db.Users.FirstOrDefaultAsync(x => x.UserId == userId);
+        if (user is null)
         {
-            var user = _store.Users.FirstOrDefault(x => x.Id == userId);
-            if (user is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "User not found");
-            }
-
-            if (user.Password != request.CurrentPassword)
-            {
-                return ErrorResponse(StatusCodes.Status401Unauthorized, "Current password is incorrect");
-            }
-
-            user.Password = request.NewPassword;
-            return OkResponse(new { passwordChanged = true }, "Password updated");
+            return ErrorResponse(StatusCodes.Status404NotFound, "User not found");
         }
+
+        if (user.PasswordHash != request.CurrentPassword)
+        {
+            return ErrorResponse(StatusCodes.Status401Unauthorized, "Current password is incorrect");
+        }
+
+        user.PasswordHash = request.NewPassword;
+        user.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+
+        return OkResponse(new { passwordChanged = true }, "Password updated");
     }
 
     [HttpPost("avatar")]
-    public IActionResult UploadAvatar([FromForm] IFormFile? file)
+    public async Task<IActionResult> UploadAvatar([FromForm] IFormFile? file)
     {
         var userId = User.GetUserId();
         if (string.IsNullOrWhiteSpace(userId))
@@ -130,39 +113,36 @@ public class MeController : ApiControllerBase
             ]);
         }
 
-        lock (_store.SyncRoot)
+        var user = await _db.Users.FirstOrDefaultAsync(x => x.UserId == userId);
+        if (user is null)
         {
-            if (!_store.ProfilesByUserId.TryGetValue(userId, out var profile))
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Profile not found");
-            }
-
-            var extension = Path.GetExtension(file.FileName);
-            var avatarUrl = $"https://cdn.example.com/avatar/{userId}-{DateTime.UtcNow:yyyyMMddHHmmss}{extension}";
-            profile.AvatarUrl = avatarUrl;
-
-            return OkResponse(new { avatarUrl }, "Avatar updated");
+            return ErrorResponse(StatusCodes.Status404NotFound, "Profile not found");
         }
+
+        var extension = Path.GetExtension(file.FileName);
+        var avatarUrl = "https://cdn.example.com/avatar/" + userId + "-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss") + extension;
+
+        return OkResponse(new { avatarUrl }, "Avatar updated");
     }
 
-    private static object ToResponse(Services.Models.ProfileRecord x)
+    private static object ToResponse(Persistence.Entities.User user)
     {
         return new
         {
-            fullName = x.FullName,
-            username = x.Username,
-            email = x.Email,
-            phone = x.Phone,
-            gender = x.Gender,
-            dob = x.Dob,
-            address = x.Address,
-            city = x.City,
-            state = x.State,
-            pincode = x.Pincode,
-            notifEmail = x.NotifEmail,
-            notifSms = x.NotifSms,
-            notifWhatsApp = x.NotifWhatsApp,
-            avatarUrl = x.AvatarUrl
+            fullName = user.FullName,
+            username = user.Username,
+            email = user.Email,
+            phone = user.Phone ?? string.Empty,
+            gender = "male",
+            dob = (DateOnly?)null,
+            address = string.Empty,
+            city = string.Empty,
+            state = string.Empty,
+            pincode = string.Empty,
+            notifEmail = true,
+            notifSms = false,
+            notifWhatsApp = false,
+            avatarUrl = "https://cdn.example.com/avatar/" + user.UserId + ".png"
         };
     }
 

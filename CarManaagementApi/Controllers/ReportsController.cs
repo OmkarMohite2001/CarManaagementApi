@@ -1,8 +1,9 @@
 using System.Text;
-using CarManaagementApi.Services;
+using CarManaagementApi.Persistence;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace CarManaagementApi.Controllers;
 
@@ -11,15 +12,15 @@ namespace CarManaagementApi.Controllers;
 [Route("api/v1/reports")]
 public class ReportsController : ApiControllerBase
 {
-    private readonly IRentXStore _store;
+    private readonly RentXDbContext _db;
 
-    public ReportsController(IRentXStore store)
+    public ReportsController(RentXDbContext db)
     {
-        _store = store;
+        _db = db;
     }
 
     [HttpGet("bookings")]
-    public IActionResult GetBookingReport(
+    public async Task<IActionResult> GetBookingReport(
         [FromQuery] DateOnly? from,
         [FromQuery] DateOnly? to,
         [FromQuery] string? locations,
@@ -33,65 +34,68 @@ public class ReportsController : ApiControllerBase
         var typeSet = SplitCsv(types);
         var statusSet = SplitCsv(statuses);
 
-        lock (_store.SyncRoot)
+        var query = _db.Bookings
+            .AsNoTracking()
+            .Include(x => x.Customer)
+            .Include(x => x.Car)
+            .AsQueryable();
+
+        if (from.HasValue)
         {
-            var query = _store.Bookings.AsEnumerable();
-
-            if (from.HasValue)
-            {
-                query = query.Where(x => DateOnly.FromDateTime(x.PickAt) >= from.Value);
-            }
-
-            if (to.HasValue)
-            {
-                query = query.Where(x => DateOnly.FromDateTime(x.PickAt) <= to.Value);
-            }
-
-            if (locationSet.Count > 0)
-            {
-                query = query.Where(x => locationSet.Contains(x.LocationCode, StringComparer.OrdinalIgnoreCase));
-            }
-
-            if (typeSet.Count > 0)
-            {
-                query = query.Where(x => typeSet.Contains(x.CarType, StringComparer.OrdinalIgnoreCase));
-            }
-
-            if (statusSet.Count > 0)
-            {
-                query = query.Where(x => statusSet.Contains(x.Status, StringComparer.OrdinalIgnoreCase));
-            }
-
-            if (!string.IsNullOrWhiteSpace(q))
-            {
-                query = query.Where(x =>
-                    x.Id.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.CustomerName.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.CarName.Contains(q, StringComparison.OrdinalIgnoreCase));
-            }
-
-            var shaped = query
-                .OrderByDescending(x => x.PickAt)
-                .Select(x => (object)new
-                {
-                    id = x.Id,
-                    date = DateOnly.FromDateTime(x.PickAt),
-                    locationCode = x.LocationCode,
-                    customerName = x.CustomerName,
-                    carName = x.CarName,
-                    carType = x.CarType,
-                    status = x.Status,
-                    days = x.Days,
-                    dailyPrice = x.DailyPrice
-                });
-
-            var (items, meta) = shaped.Paginate(page, pageSize);
-            return OkResponse<IEnumerable<object>>(items, meta: meta);
+            query = query.Where(x => DateOnly.FromDateTime(x.PickAt) >= from.Value);
         }
+
+        if (to.HasValue)
+        {
+            query = query.Where(x => DateOnly.FromDateTime(x.PickAt) <= to.Value);
+        }
+
+        if (locationSet.Count > 0)
+        {
+            query = query.Where(x => locationSet.Contains(x.LocationCode));
+        }
+
+        if (typeSet.Count > 0)
+        {
+            query = query.Where(x => typeSet.Contains(x.Car.CarType));
+        }
+
+        if (statusSet.Count > 0)
+        {
+            query = query.Where(x => statusSet.Contains(x.Status));
+        }
+
+        if (!string.IsNullOrWhiteSpace(q))
+        {
+            query = query.Where(x =>
+                x.BookingId.Contains(q)
+                || x.Customer.Name.Contains(q)
+                || x.Car.Brand.Contains(q)
+                || x.Car.Model.Contains(q));
+        }
+
+        var rows = await query
+            .OrderByDescending(x => x.PickAt)
+            .Select(x => (object)new
+            {
+                id = x.BookingId,
+                date = DateOnly.FromDateTime(x.PickAt),
+                locationCode = x.LocationCode,
+                customerName = x.Customer.Name,
+                carName = x.Car.Brand + " " + x.Car.Model,
+                carType = x.Car.CarType,
+                status = x.Status,
+                days = x.Days,
+                dailyPrice = x.DailyPrice
+            })
+            .ToListAsync();
+
+        var (items, meta) = rows.Paginate(page, pageSize);
+        return OkResponse<IEnumerable<object>>(items, meta: meta);
     }
 
     [HttpGet("bookings/summary")]
-    public IActionResult GetBookingSummary(
+    public async Task<IActionResult> GetBookingSummary(
         [FromQuery] DateOnly? from,
         [FromQuery] DateOnly? to,
         [FromQuery] string? locations,
@@ -100,81 +104,66 @@ public class ReportsController : ApiControllerBase
         var locationSet = SplitCsv(locations);
         var statusSet = SplitCsv(statuses);
 
-        lock (_store.SyncRoot)
+        var query = _db.Bookings.AsNoTracking().AsQueryable();
+
+        if (from.HasValue)
         {
-            var query = _store.Bookings.AsEnumerable();
-
-            if (from.HasValue)
-            {
-                query = query.Where(x => DateOnly.FromDateTime(x.PickAt) >= from.Value);
-            }
-
-            if (to.HasValue)
-            {
-                query = query.Where(x => DateOnly.FromDateTime(x.PickAt) <= to.Value);
-            }
-
-            if (locationSet.Count > 0)
-            {
-                query = query.Where(x => locationSet.Contains(x.LocationCode, StringComparer.OrdinalIgnoreCase));
-            }
-
-            if (statusSet.Count > 0)
-            {
-                query = query.Where(x => statusSet.Contains(x.Status, StringComparer.OrdinalIgnoreCase));
-            }
-
-            var list = query.ToList();
-            var totalBookings = list.Count;
-            var totalRevenue = list.Where(x => x.Status is "approved" or "ongoing" or "completed").Sum(x => x.DailyPrice * x.Days);
-            var cancelled = list.Count(x => x.Status == "cancelled");
-            var avgTicket = totalBookings == 0 ? 0 : (int)Math.Round(totalRevenue / totalBookings, MidpointRounding.AwayFromZero);
-
-            return OkResponse(new
-            {
-                totalBookings,
-                totalRevenue,
-                cancelled,
-                avgTicket
-            });
+            query = query.Where(x => DateOnly.FromDateTime(x.PickAt) >= from.Value);
         }
+
+        if (to.HasValue)
+        {
+            query = query.Where(x => DateOnly.FromDateTime(x.PickAt) <= to.Value);
+        }
+
+        if (locationSet.Count > 0)
+        {
+            query = query.Where(x => locationSet.Contains(x.LocationCode));
+        }
+
+        if (statusSet.Count > 0)
+        {
+            query = query.Where(x => statusSet.Contains(x.Status));
+        }
+
+        var list = await query.ToListAsync();
+        var totalBookings = list.Count;
+        var totalRevenue = list.Where(x => x.Status == "approved" || x.Status == "ongoing" || x.Status == "completed").Sum(x => x.DailyPrice * x.Days);
+        var cancelled = list.Count(x => x.Status == "cancelled");
+        var avgTicket = totalBookings == 0 ? 0 : (int)Math.Round(totalRevenue / totalBookings, MidpointRounding.AwayFromZero);
+
+        return OkResponse(new
+        {
+            totalBookings,
+            totalRevenue,
+            cancelled,
+            avgTicket
+        });
     }
 
     [HttpGet("bookings/export")]
-    public IActionResult ExportBookings([FromQuery] string format = "csv")
+    public async Task<IActionResult> ExportBookings([FromQuery] string format = "csv")
     {
         if (!string.Equals(format, "csv", StringComparison.OrdinalIgnoreCase))
         {
             return ErrorResponse(StatusCodes.Status400BadRequest, "Only csv export is supported.");
         }
 
-        List<object> rows;
-        lock (_store.SyncRoot)
-        {
-            rows = _store.Bookings
-                .OrderByDescending(x => x.PickAt)
-                .Select(x => (object)new
-                {
-                    x.Id,
-                    Date = DateOnly.FromDateTime(x.PickAt),
-                    x.LocationCode,
-                    x.CustomerName,
-                    x.CarName,
-                    x.CarType,
-                    x.Status,
-                    x.Days,
-                    x.DailyPrice
-                }).ToList();
-        }
+        var rows = await _db.Bookings
+            .AsNoTracking()
+            .Include(x => x.Customer)
+            .Include(x => x.Car)
+            .OrderByDescending(x => x.PickAt)
+            .ToListAsync();
 
         var sb = new StringBuilder();
         sb.AppendLine("id,date,locationCode,customerName,carName,carType,status,days,dailyPrice");
-        foreach (dynamic row in rows)
+        foreach (var row in rows)
         {
-            sb.AppendLine($"{row.Id},{row.Date},{row.LocationCode},{EscapeCsv(row.CustomerName)},{EscapeCsv(row.CarName)},{row.CarType},{row.Status},{row.Days},{row.DailyPrice}");
+            sb.AppendLine($"{row.BookingId},{DateOnly.FromDateTime(row.PickAt)},{row.LocationCode},{EscapeCsv(row.Customer.Name)},{EscapeCsv(row.Car.Brand + " " + row.Car.Model)},{row.Car.CarType},{row.Status},{row.Days},{row.DailyPrice}");
         }
 
-        return File(Encoding.UTF8.GetBytes(sb.ToString()), "text/csv", $"report-bookings-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
+        return File(Encoding.UTF8.GetBytes(sb.ToString()), "text/csv", "report-bookings-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss") + ".csv");
     }
 
     private static List<string> SplitCsv(string? value)
@@ -194,6 +183,6 @@ public class ReportsController : ApiControllerBase
             return string.Empty;
         }
 
-        return value.Contains(',') ? $"\"{value.Replace("\"", "\"\"")}\"" : value;
+        return value.Contains(',') ? "\"" + value.Replace("\"", "\"\"") + "\"" : value;
     }
 }

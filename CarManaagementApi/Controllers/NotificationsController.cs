@@ -1,7 +1,8 @@
-using CarManaagementApi.Services;
+using CarManaagementApi.Persistence;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace CarManaagementApi.Controllers;
 
@@ -10,74 +11,80 @@ namespace CarManaagementApi.Controllers;
 [Route("api/v1/notifications")]
 public class NotificationsController : ApiControllerBase
 {
-    private readonly IRentXStore _store;
+    private readonly RentXDbContext _db;
 
-    public NotificationsController(IRentXStore store)
+    public NotificationsController(RentXDbContext db)
     {
-        _store = store;
+        _db = db;
     }
 
     [HttpGet("unread-count")]
-    public IActionResult GetUnreadCount()
+    public async Task<IActionResult> GetUnreadCount()
     {
-        lock (_store.SyncRoot)
-        {
-            var unreadCount = _store.Notifications.Count(x => !x.IsRead);
-            return OkResponse(new { unreadCount });
-        }
+        var userId = User.GetUserId();
+        var unreadCount = await _db.Notifications
+            .CountAsync(x => !x.IsRead && (x.UserId == null || x.UserId == userId));
+
+        return OkResponse(new { unreadCount });
     }
 
     [HttpGet]
-    public IActionResult GetNotifications([FromQuery] int page = 1, [FromQuery] int pageSize = 20)
+    public async Task<IActionResult> GetNotifications([FromQuery] int page = 1, [FromQuery] int pageSize = 20)
     {
-        lock (_store.SyncRoot)
-        {
-            var query = _store.Notifications
-                .OrderByDescending(x => x.CreatedAt)
-                .Select(x => (object)new
-                {
-                    id = x.Id,
-                    title = x.Title,
-                    message = x.Message,
-                    isRead = x.IsRead,
-                    createdAt = x.CreatedAt
-                });
+        var userId = User.GetUserId();
 
-            var (items, meta) = query.Paginate(page, pageSize);
-            return OkResponse<IEnumerable<object>>(items, meta: meta);
-        }
+        var rows = await _db.Notifications
+            .AsNoTracking()
+            .Where(x => x.UserId == null || x.UserId == userId)
+            .OrderByDescending(x => x.CreatedAt)
+            .Select(x => (object)new
+            {
+                id = x.NotificationId,
+                title = x.Title,
+                message = x.Message,
+                isRead = x.IsRead,
+                createdAt = x.CreatedAt
+            })
+            .ToListAsync();
+
+        var (items, meta) = rows.Paginate(page, pageSize);
+        return OkResponse<IEnumerable<object>>(items, meta: meta);
     }
 
     [HttpPatch("{id}/read")]
-    public IActionResult MarkRead(string id)
+    public async Task<IActionResult> MarkRead(string id)
     {
-        lock (_store.SyncRoot)
+        var userId = User.GetUserId();
+        var notification = await _db.Notifications.FirstOrDefaultAsync(x => x.NotificationId == id && (x.UserId == null || x.UserId == userId));
+        if (notification is null)
         {
-            var notification = _store.Notifications.FirstOrDefault(x => x.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
-            if (notification is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Notification not found");
-            }
-
-            notification.IsRead = true;
-            return OkResponse(new { id = notification.Id, isRead = true }, "Notification marked as read");
+            return ErrorResponse(StatusCodes.Status404NotFound, "Notification not found");
         }
+
+        notification.IsRead = true;
+        notification.ReadAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+
+        return OkResponse(new { id = notification.NotificationId, isRead = true }, "Notification marked as read");
     }
 
     [HttpPatch("mark-all-read")]
-    public IActionResult MarkAllRead()
+    public async Task<IActionResult> MarkAllRead()
     {
-        int count;
-        lock (_store.SyncRoot)
+        var userId = User.GetUserId();
+
+        var notifications = await _db.Notifications
+            .Where(x => !x.IsRead && (x.UserId == null || x.UserId == userId))
+            .ToListAsync();
+
+        foreach (var notification in notifications)
         {
-            count = 0;
-            foreach (var notification in _store.Notifications.Where(x => !x.IsRead))
-            {
-                notification.IsRead = true;
-                count++;
-            }
+            notification.IsRead = true;
+            notification.ReadAt = DateTime.UtcNow;
         }
 
-        return OkResponse(new { updated = count }, "All notifications marked as read");
+        await _db.SaveChangesAsync();
+
+        return OkResponse(new { updated = notifications.Count }, "All notifications marked as read");
     }
 }

@@ -1,7 +1,8 @@
-using CarManaagementApi.Services;
+using CarManaagementApi.Persistence;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace CarManaagementApi.Controllers;
 
@@ -10,68 +11,67 @@ namespace CarManaagementApi.Controllers;
 [Route("api/v1/search")]
 public class SearchController : ApiControllerBase
 {
-    private readonly IRentXStore _store;
+    private readonly RentXDbContext _db;
 
-    public SearchController(IRentXStore store)
+    public SearchController(RentXDbContext db)
     {
-        _store = store;
+        _db = db;
     }
 
     [HttpGet("global")]
-    public IActionResult GlobalSearch([FromQuery] string q)
+    public async Task<IActionResult> GlobalSearch([FromQuery] string q)
     {
         if (string.IsNullOrWhiteSpace(q))
         {
             return OkResponse<IEnumerable<object>>([]);
         }
 
-        lock (_store.SyncRoot)
-        {
-            var bookingResults = _store.Bookings
-                .Where(x => x.Id.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.CustomerName.Contains(q, StringComparison.OrdinalIgnoreCase))
-                .Take(5)
-                .Select(x => (object)new
-                {
-                    type = "booking",
-                    id = x.Id,
-                    title = $"{x.Id} - {x.CustomerName}",
-                    route = "/layout/manage-bookings"
-                });
+        var bookingResults = await _db.Bookings
+            .AsNoTracking()
+            .Include(x => x.Customer)
+            .Where(x => x.BookingId.Contains(q) || x.Customer.Name.Contains(q))
+            .Take(5)
+            .Select(x => (object)new
+            {
+                type = "booking",
+                id = x.BookingId,
+                title = x.BookingId + " - " + x.Customer.Name,
+                route = "/layout/manage-bookings"
+            })
+            .ToListAsync();
 
-            var customerResults = _store.Customers
-                .Where(x => x.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Id.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Phone.Contains(q, StringComparison.OrdinalIgnoreCase))
-                .Take(5)
-                .Select(x => (object)new
-                {
-                    type = "customer",
-                    id = x.Id,
-                    title = x.Name,
-                    route = "/layout/customers"
-                });
+        var customerResults = await _db.Customers
+            .AsNoTracking()
+            .Where(x => x.Name.Contains(q) || x.CustomerId.Contains(q) || x.Phone.Contains(q))
+            .Take(5)
+            .Select(x => (object)new
+            {
+                type = "customer",
+                id = x.CustomerId,
+                title = x.Name,
+                route = "/layout/customers"
+            })
+            .ToListAsync();
 
-            var carResults = _store.Cars
-                .Where(x => x.Id.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Brand.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Model.Contains(q, StringComparison.OrdinalIgnoreCase))
-                .Take(5)
-                .Select(x => (object)new
-                {
-                    type = "car",
-                    id = x.Id,
-                    title = $"{x.Brand} {x.Model}",
-                    route = "/layout/car-master"
-                });
+        var carResults = await _db.Cars
+            .AsNoTracking()
+            .Where(x => x.CarId.Contains(q) || x.Brand.Contains(q) || x.Model.Contains(q))
+            .Take(5)
+            .Select(x => (object)new
+            {
+                type = "car",
+                id = x.CarId,
+                title = x.Brand + " " + x.Model,
+                route = "/layout/car-master"
+            })
+            .ToListAsync();
 
-            var data = bookingResults
-                .Concat(customerResults)
-                .Concat(carResults)
-                .Take(20)
-                .ToList();
+        var data = bookingResults
+            .Concat(customerResults)
+            .Concat(carResults)
+            .Take(20)
+            .ToList();
 
-            return OkResponse<IEnumerable<object>>(data);
-        }
+        return OkResponse<IEnumerable<object>>(data);
     }
 }

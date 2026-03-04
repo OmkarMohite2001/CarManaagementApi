@@ -1,10 +1,11 @@
 using System.Text.RegularExpressions;
 using CarManaagementApi.Contracts;
-using CarManaagementApi.Services;
-using CarManaagementApi.Services.Models;
+using CarManaagementApi.Persistence;
+using CarManaagementApi.Persistence.Entities;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace CarManaagementApi.Controllers;
 
@@ -15,15 +16,15 @@ public class AdminCarsController : ApiControllerBase
 {
     private static readonly Regex RegNoRegex = new("^[A-Z]{2}\\d{2}-[A-Z]{2}-\\d{4}$", RegexOptions.Compiled);
 
-    private readonly IRentXStore _store;
+    private readonly RentXDbContext _db;
 
-    public AdminCarsController(IRentXStore store)
+    public AdminCarsController(RentXDbContext db)
     {
-        _store = store;
+        _db = db;
     }
 
     [HttpGet]
-    public IActionResult GetAdminCars(
+    public async Task<IActionResult> GetAdminCars(
         [FromQuery] string? q,
         [FromQuery] string? branchId,
         [FromQuery] string? type,
@@ -33,56 +34,57 @@ public class AdminCarsController : ApiControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 20)
     {
-        lock (_store.SyncRoot)
+        var query = _db.Cars
+            .AsNoTracking()
+            .Include(x => x.CarImages)
+            .AsQueryable();
+
+        if (!string.IsNullOrWhiteSpace(q))
         {
-            var query = _store.Cars.AsEnumerable();
-
-            if (!string.IsNullOrWhiteSpace(q))
-            {
-                query = query.Where(x =>
-                    x.Id.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Brand.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Model.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.RegNo.Contains(q, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (!string.IsNullOrWhiteSpace(branchId))
-            {
-                query = query.Where(x => x.BranchId.Equals(branchId, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (!string.IsNullOrWhiteSpace(type))
-            {
-                query = query.Where(x => x.Type.Equals(type, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (!string.IsNullOrWhiteSpace(fuel))
-            {
-                query = query.Where(x => x.Fuel.Equals(fuel, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (!string.IsNullOrWhiteSpace(transmission))
-            {
-                query = query.Where(x => x.Transmission.Equals(transmission, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (active.HasValue)
-            {
-                query = query.Where(x => x.Active == active.Value);
-            }
-
-            var shaped = query
-                .OrderBy(x => x.Brand)
-                .ThenBy(x => x.Model)
-                .Select(ToResponse);
-
-            var (items, meta) = shaped.Paginate(page, pageSize);
-            return OkResponse<IEnumerable<object>>(items, meta: meta);
+            query = query.Where(x =>
+                x.CarId.Contains(q)
+                || x.Brand.Contains(q)
+                || x.Model.Contains(q)
+                || x.RegNo.Contains(q));
         }
+
+        if (!string.IsNullOrWhiteSpace(branchId))
+        {
+            query = query.Where(x => x.BranchId == branchId);
+        }
+
+        if (!string.IsNullOrWhiteSpace(type))
+        {
+            query = query.Where(x => x.CarType == type);
+        }
+
+        if (!string.IsNullOrWhiteSpace(fuel))
+        {
+            query = query.Where(x => x.Fuel == fuel);
+        }
+
+        if (!string.IsNullOrWhiteSpace(transmission))
+        {
+            query = query.Where(x => x.Transmission == transmission);
+        }
+
+        if (active.HasValue)
+        {
+            query = query.Where(x => x.IsActive == active.Value);
+        }
+
+        var rows = await query
+            .OrderBy(x => x.Brand)
+            .ThenBy(x => x.Model)
+            .Select(x => ToResponse(x))
+            .ToListAsync();
+
+        var (items, meta) = rows.Paginate(page, pageSize);
+        return OkResponse<IEnumerable<object>>(items, meta: meta);
     }
 
     [HttpPost]
-    public IActionResult CreateAdminCar(AdminCarUpsertRequest request)
+    public async Task<IActionResult> CreateAdminCar(AdminCarUpsertRequest request)
     {
         var validation = ValidateRequest(request);
         if (validation is not null)
@@ -90,45 +92,64 @@ public class AdminCarsController : ApiControllerBase
             return validation;
         }
 
-        lock (_store.SyncRoot)
+        var branchExists = await _db.Branches.AnyAsync(x => x.BranchId == request.BranchId);
+        if (!branchExists)
         {
-            if (!_store.Branches.Any(x => x.Id.Equals(request.BranchId, StringComparison.OrdinalIgnoreCase)))
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Branch not found");
-            }
-
-            if (_store.Cars.Any(x => x.RegNo.Equals(request.RegNo, StringComparison.OrdinalIgnoreCase)))
-            {
-                return ErrorResponse(StatusCodes.Status409Conflict, "Duplicate regNo");
-            }
-
-            var car = new AdminCarRecord
-            {
-                Id = _store.NextId("CAR"),
-                Brand = request.Brand,
-                Model = request.Model,
-                Type = request.Type.ToLowerInvariant(),
-                Fuel = request.Fuel.ToLowerInvariant(),
-                Transmission = request.Transmission.ToLowerInvariant(),
-                Seats = request.Seats,
-                DailyPrice = request.DailyPrice,
-                RegNo = request.RegNo.ToUpperInvariant(),
-                Odometer = request.Odometer,
-                BranchId = request.BranchId,
-                Active = request.Active,
-                Rating = 4.5m,
-                ImageUrls = request.ImageUrls ?? [],
-                ImageUrl = request.ImageUrls?.FirstOrDefault() ?? string.Empty,
-                LocationCodes = [request.BranchId]
-            };
-
-            _store.Cars.Add(car);
-            return OkResponse(ToResponse(car), "Car created");
+            return ErrorResponse(StatusCodes.Status404NotFound, "Branch not found");
         }
+
+        var regExists = await _db.Cars.AnyAsync(x => x.RegNo == request.RegNo);
+        if (regExists)
+        {
+            return ErrorResponse(StatusCodes.Status409Conflict, "Duplicate regNo");
+        }
+
+        var carId = await IdGenerator.NextAsync(_db.Cars.Select(x => x.CarId), "CAR");
+
+        var car = new Car
+        {
+            CarId = carId,
+            Brand = request.Brand,
+            Model = request.Model,
+            CarType = request.Type.ToLowerInvariant(),
+            Fuel = request.Fuel.ToLowerInvariant(),
+            Transmission = request.Transmission.ToLowerInvariant(),
+            Seats = (byte)request.Seats,
+            DailyPrice = request.DailyPrice,
+            RegNo = request.RegNo.ToUpperInvariant(),
+            Odometer = request.Odometer,
+            BranchId = request.BranchId,
+            IsActive = request.Active,
+            Rating = 4.5m,
+            PrimaryImageUrl = request.ImageUrls?.FirstOrDefault(),
+            CreatedAt = DateTime.UtcNow
+        };
+
+        _db.Cars.Add(car);
+
+        if (request.ImageUrls is not null)
+        {
+            var sort = 1;
+            foreach (var imageUrl in request.ImageUrls)
+            {
+                _db.CarImages.Add(new CarImage
+                {
+                    CarId = car.CarId,
+                    ImageUrl = imageUrl,
+                    SortOrder = sort++
+                });
+            }
+        }
+
+        await _db.SaveChangesAsync();
+
+        car.CarImages = await _db.CarImages.Where(x => x.CarId == car.CarId).OrderBy(x => x.SortOrder).ToListAsync();
+
+        return OkResponse(ToResponse(car), "Car created");
     }
 
     [HttpPut("{carId}")]
-    public IActionResult UpdateAdminCar(string carId, AdminCarUpsertRequest request)
+    public async Task<IActionResult> UpdateAdminCar(string carId, AdminCarUpsertRequest request)
     {
         var validation = ValidateRequest(request);
         if (validation is not null)
@@ -136,107 +157,128 @@ public class AdminCarsController : ApiControllerBase
             return validation;
         }
 
-        lock (_store.SyncRoot)
+        var existing = await _db.Cars.Include(x => x.CarImages).FirstOrDefaultAsync(x => x.CarId == carId);
+        if (existing is null)
         {
-            var existing = _store.Cars.FirstOrDefault(x => x.Id.Equals(carId, StringComparison.OrdinalIgnoreCase));
-            if (existing is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Car not found");
-            }
-
-            if (!_store.Branches.Any(x => x.Id.Equals(request.BranchId, StringComparison.OrdinalIgnoreCase)))
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Branch not found");
-            }
-
-            if (_store.Cars.Any(x =>
-                    !x.Id.Equals(carId, StringComparison.OrdinalIgnoreCase)
-                    && x.RegNo.Equals(request.RegNo, StringComparison.OrdinalIgnoreCase)))
-            {
-                return ErrorResponse(StatusCodes.Status409Conflict, "Duplicate regNo");
-            }
-
-            existing.Brand = request.Brand;
-            existing.Model = request.Model;
-            existing.Type = request.Type.ToLowerInvariant();
-            existing.Fuel = request.Fuel.ToLowerInvariant();
-            existing.Transmission = request.Transmission.ToLowerInvariant();
-            existing.Seats = request.Seats;
-            existing.DailyPrice = request.DailyPrice;
-            existing.RegNo = request.RegNo.ToUpperInvariant();
-            existing.Odometer = request.Odometer;
-            existing.BranchId = request.BranchId;
-            existing.Active = request.Active;
-            existing.ImageUrls = request.ImageUrls ?? existing.ImageUrls;
-            existing.ImageUrl = existing.ImageUrls.FirstOrDefault() ?? existing.ImageUrl;
-            existing.LocationCodes = [request.BranchId];
-
-            return OkResponse(ToResponse(existing), "Car updated");
+            return ErrorResponse(StatusCodes.Status404NotFound, "Car not found");
         }
+
+        var branchExists = await _db.Branches.AnyAsync(x => x.BranchId == request.BranchId);
+        if (!branchExists)
+        {
+            return ErrorResponse(StatusCodes.Status404NotFound, "Branch not found");
+        }
+
+        var regExists = await _db.Cars.AnyAsync(x => x.CarId != carId && x.RegNo == request.RegNo);
+        if (regExists)
+        {
+            return ErrorResponse(StatusCodes.Status409Conflict, "Duplicate regNo");
+        }
+
+        existing.Brand = request.Brand;
+        existing.Model = request.Model;
+        existing.CarType = request.Type.ToLowerInvariant();
+        existing.Fuel = request.Fuel.ToLowerInvariant();
+        existing.Transmission = request.Transmission.ToLowerInvariant();
+        existing.Seats = (byte)request.Seats;
+        existing.DailyPrice = request.DailyPrice;
+        existing.RegNo = request.RegNo.ToUpperInvariant();
+        existing.Odometer = request.Odometer;
+        existing.BranchId = request.BranchId;
+        existing.IsActive = request.Active;
+        existing.UpdatedAt = DateTime.UtcNow;
+
+        if (request.ImageUrls is not null)
+        {
+            _db.CarImages.RemoveRange(existing.CarImages);
+            var sort = 1;
+            foreach (var imageUrl in request.ImageUrls)
+            {
+                _db.CarImages.Add(new CarImage
+                {
+                    CarId = existing.CarId,
+                    ImageUrl = imageUrl,
+                    SortOrder = sort++
+                });
+            }
+            existing.PrimaryImageUrl = request.ImageUrls.FirstOrDefault();
+        }
+
+        await _db.SaveChangesAsync();
+
+        existing.CarImages = await _db.CarImages.Where(x => x.CarId == existing.CarId).OrderBy(x => x.SortOrder).ToListAsync();
+
+        return OkResponse(ToResponse(existing), "Car updated");
     }
 
     [HttpPatch("{carId}/active")]
-    public IActionResult PatchActive(string carId, PatchActiveRequest request)
+    public async Task<IActionResult> PatchActive(string carId, PatchActiveRequest request)
     {
-        lock (_store.SyncRoot)
+        var car = await _db.Cars.FirstOrDefaultAsync(x => x.CarId == carId);
+        if (car is null)
         {
-            var car = _store.Cars.FirstOrDefault(x => x.Id.Equals(carId, StringComparison.OrdinalIgnoreCase));
-            if (car is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Car not found");
-            }
-
-            car.Active = request.Active;
-            return OkResponse(new { id = car.Id, active = car.Active }, "Car active status updated");
+            return ErrorResponse(StatusCodes.Status404NotFound, "Car not found");
         }
+
+        car.IsActive = request.Active;
+        car.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+
+        return OkResponse(new { id = car.CarId, active = car.IsActive }, "Car active status updated");
     }
 
     [HttpDelete("{carId}")]
-    public IActionResult DeleteAdminCar(string carId)
+    public async Task<IActionResult> DeleteAdminCar(string carId)
     {
-        lock (_store.SyncRoot)
+        var car = await _db.Cars.FirstOrDefaultAsync(x => x.CarId == carId);
+        if (car is null)
         {
-            var car = _store.Cars.FirstOrDefault(x => x.Id.Equals(carId, StringComparison.OrdinalIgnoreCase));
-            if (car is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Car not found");
-            }
-
-            _store.Cars.Remove(car);
-            return NoContent();
+            return ErrorResponse(StatusCodes.Status404NotFound, "Car not found");
         }
+
+        _db.Cars.Remove(car);
+        await _db.SaveChangesAsync();
+        return NoContent();
     }
 
     [HttpPost("{carId}/images")]
-    public IActionResult UploadImages(string carId, [FromForm] IFormFileCollection files)
+    public async Task<IActionResult> UploadImages(string carId, [FromForm] IFormFileCollection files)
     {
-        lock (_store.SyncRoot)
+        var car = await _db.Cars.FirstOrDefaultAsync(x => x.CarId == carId);
+        if (car is null)
         {
-            var car = _store.Cars.FirstOrDefault(x => x.Id.Equals(carId, StringComparison.OrdinalIgnoreCase));
-            if (car is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Car not found");
-            }
-
-            var uploaded = new List<object>();
-            IEnumerable<IFormFile> safeFiles = files?.Count > 0 ? files : Array.Empty<IFormFile>();
-
-            foreach (var file in safeFiles)
-            {
-                var fileId = _store.NextId("FIL");
-                var extension = Path.GetExtension(file.FileName);
-                var url = $"https://cdn.example.com/cars/{car.Id}-{fileId}{extension}";
-                car.ImageUrls.Add(url);
-                if (string.IsNullOrWhiteSpace(car.ImageUrl))
-                {
-                    car.ImageUrl = url;
-                }
-
-                uploaded.Add(new { fileId, url });
-            }
-
-            return OkResponse<IEnumerable<object>>(uploaded, "Images uploaded");
+            return ErrorResponse(StatusCodes.Status404NotFound, "Car not found");
         }
+
+        var maxSort = await _db.CarImages.Where(x => x.CarId == carId).Select(x => (int?)x.SortOrder).MaxAsync() ?? 0;
+        var uploaded = new List<object>();
+        IEnumerable<IFormFile> safeFiles = files?.Count > 0 ? files : Array.Empty<IFormFile>();
+
+        foreach (var file in safeFiles)
+        {
+            var fileId = await IdGenerator.NextAsync(_db.CarImages.Select(x => "FIL-" + x.CarImageId), "FIL");
+            var extension = Path.GetExtension(file.FileName);
+            var url = "https://cdn.example.com/cars/" + car.CarId + "-" + fileId + extension;
+
+            maxSort++;
+            _db.CarImages.Add(new CarImage
+            {
+                CarId = car.CarId,
+                ImageUrl = url,
+                SortOrder = maxSort
+            });
+
+            if (string.IsNullOrWhiteSpace(car.PrimaryImageUrl))
+            {
+                car.PrimaryImageUrl = url;
+            }
+
+            uploaded.Add(new { fileId, url });
+        }
+
+        await _db.SaveChangesAsync();
+
+        return OkResponse<IEnumerable<object>>(uploaded, "Images uploaded");
     }
 
     private IActionResult? ValidateRequest(AdminCarUpsertRequest request)
@@ -286,14 +328,14 @@ public class AdminCarsController : ApiControllerBase
         return null;
     }
 
-    private static object ToResponse(AdminCarRecord x)
+    private static object ToResponse(Car x)
     {
         return new
         {
-            id = x.Id,
+            id = x.CarId,
             brand = x.Brand,
             model = x.Model,
-            type = x.Type,
+            type = x.CarType,
             fuel = x.Fuel,
             transmission = x.Transmission,
             seats = x.Seats,
@@ -301,8 +343,8 @@ public class AdminCarsController : ApiControllerBase
             regNo = x.RegNo,
             odometer = x.Odometer,
             branchId = x.BranchId,
-            imageUrls = x.ImageUrls,
-            active = x.Active
+            imageUrls = x.CarImages.OrderBy(i => i.SortOrder).Select(i => i.ImageUrl).ToList(),
+            active = x.IsActive
         };
     }
 

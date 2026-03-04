@@ -2,11 +2,12 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 using CarManaagementApi.Contracts;
-using CarManaagementApi.Services;
-using CarManaagementApi.Services.Models;
+using CarManaagementApi.Persistence;
+using CarManaagementApi.Persistence.Entities;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 
@@ -16,50 +17,47 @@ namespace CarManaagementApi.Controllers;
 [Route("api/v1/auth")]
 public class AuthController : ApiControllerBase
 {
-    private readonly IRentXStore _store;
+    private readonly RentXDbContext _db;
     private readonly JwtSettings _jwtSettings;
 
-    public AuthController(IRentXStore store, IOptions<JwtSettings> jwtOptions)
+    public AuthController(RentXDbContext db, IOptions<JwtSettings> jwtOptions)
     {
-        _store = store;
+        _db = db;
         _jwtSettings = jwtOptions.Value;
     }
 
     [HttpPost("login")]
     [AllowAnonymous]
-    public IActionResult Login(LoginRequest request)
+    public async Task<IActionResult> Login(LoginRequest request)
     {
-        UserRecord? user;
-        lock (_store.SyncRoot)
+        var user = await _db.Users.FirstOrDefaultAsync(x =>
+            x.IsActive &&
+            (x.Username == request.UsernameOrEmail || x.Email == request.UsernameOrEmail) &&
+            x.PasswordHash == request.Password);
+
+        if (user is null)
         {
-            user = _store.Users.FirstOrDefault(x =>
-                x.Active &&
-                (x.Username.Equals(request.UsernameOrEmail, StringComparison.OrdinalIgnoreCase)
-                || x.Email.Equals(request.UsernameOrEmail, StringComparison.OrdinalIgnoreCase))
-                && x.Password == request.Password);
-
-            if (user is null)
-            {
-                return ErrorResponse(StatusCodes.Status401Unauthorized, "Invalid username/email or password.");
-            }
-
-            user.LastLogin = DateTime.UtcNow;
+            return ErrorResponse(StatusCodes.Status401Unauthorized, "Invalid username/email or password.");
         }
+
+        user.LastLoginAt = DateTime.UtcNow;
 
         var expiresInSeconds = _jwtSettings.AccessTokenExpiryMinutes * 60;
         var accessToken = CreateAccessToken(user);
         var refreshToken = CreateRefreshToken();
 
-        lock (_store.SyncRoot)
+        var refreshExpiryDays = request.RememberMe
+            ? Math.Max(_jwtSettings.RefreshTokenExpiryDays, 30)
+            : _jwtSettings.RefreshTokenExpiryDays;
+
+        _db.UserRefreshTokens.Add(new UserRefreshToken
         {
-            _store.RefreshTokens.Add(new RefreshTokenRecord
-            {
-                Token = refreshToken,
-                UserId = user.Id,
-                ExpiresAt = DateTime.UtcNow.AddDays(_jwtSettings.RefreshTokenExpiryDays),
-                Revoked = false
-            });
-        }
+            UserId = user.UserId,
+            TokenHash = refreshToken,
+            ExpiresAt = DateTime.UtcNow.AddDays(refreshExpiryDays)
+        });
+
+        await _db.SaveChangesAsync();
 
         return OkResponse(new
         {
@@ -68,17 +66,17 @@ public class AuthController : ApiControllerBase
             expiresInSeconds,
             user = new
             {
-                id = user.Id,
-                name = user.Name,
+                id = user.UserId,
+                name = user.FullName,
                 email = user.Email,
-                role = user.Role
+                role = user.RoleCode
             }
         }, "Login successful");
     }
 
     [HttpPost("register")]
     [AllowAnonymous]
-    public IActionResult Register(RegisterRequest request)
+    public async Task<IActionResult> Register(RegisterRequest request)
     {
         if (!string.Equals(request.Password, request.ConfirmPassword, StringComparison.Ordinal))
         {
@@ -87,48 +85,55 @@ public class AuthController : ApiControllerBase
             ]);
         }
 
-        lock (_store.SyncRoot)
+        var emailExists = await _db.Users.AnyAsync(x => x.Email == request.Email);
+        if (emailExists)
         {
-            if (_store.Users.Any(x => x.Email.Equals(request.Email, StringComparison.OrdinalIgnoreCase)))
-            {
-                return ErrorResponse(StatusCodes.Status409Conflict, "Email already exists.");
-            }
-
-            var user = new UserRecord
-            {
-                Id = _store.NextId("U"),
-                Name = request.FullName,
-                Username = request.Email.Split('@')[0],
-                Email = request.Email,
-                Phone = string.Empty,
-                Role = "viewer",
-                Active = true,
-                Password = request.Password,
-                CreatedAt = DateTime.UtcNow
-            };
-
-            _store.Users.Add(user);
-            _store.ProfilesByUserId[user.Id] = new ProfileRecord
-            {
-                FullName = request.FullName,
-                Username = user.Username,
-                Email = user.Email,
-                Phone = string.Empty,
-                Gender = "male",
-                NotifEmail = true,
-                NotifSms = false,
-                NotifWhatsApp = false,
-                AvatarUrl = string.Empty
-            };
-
-            return OkResponse(new
-            {
-                id = user.Id,
-                fullName = user.Name,
-                email = user.Email,
-                role = user.Role
-            }, "Registration successful");
+            return ErrorResponse(StatusCodes.Status409Conflict, "Email already exists.");
         }
+
+        var viewerRoleExists = await _db.Roles.AnyAsync(x => x.RoleCode == "viewer");
+        if (!viewerRoleExists)
+        {
+            _db.Roles.Add(new Role
+            {
+                RoleCode = "viewer",
+                RoleName = "Viewer",
+                IsSystem = true,
+                CreatedAt = DateTime.UtcNow
+            });
+        }
+
+        var userId = await IdGenerator.NextAsync(_db.Users.Select(x => x.UserId), "U");
+        var username = request.Email.Split('@')[0];
+        var usernameTaken = await _db.Users.AnyAsync(x => x.Username == username);
+        if (usernameTaken)
+        {
+            username = $"{username}{DateTime.UtcNow:HHmmss}";
+        }
+
+        var user = new User
+        {
+            UserId = userId,
+            Username = username,
+            FullName = request.FullName,
+            Email = request.Email,
+            Phone = null,
+            RoleCode = "viewer",
+            PasswordHash = request.Password,
+            IsActive = true,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        _db.Users.Add(user);
+        await _db.SaveChangesAsync();
+
+        return OkResponse(new
+        {
+            id = user.UserId,
+            fullName = user.FullName,
+            email = user.Email,
+            role = user.RoleCode
+        }, "Registration successful");
     }
 
     [HttpPost("forgot-password/send-code")]
@@ -140,7 +145,7 @@ public class AuthController : ApiControllerBase
 
     [HttpPost("forgot-password/reset")]
     [AllowAnonymous]
-    public IActionResult ResetForgotPassword(ResetPasswordRequest request)
+    public async Task<IActionResult> ResetForgotPassword(ResetPasswordRequest request)
     {
         if (!string.Equals(request.NewPassword, request.ConfirmNewPassword, StringComparison.Ordinal))
         {
@@ -149,58 +154,47 @@ public class AuthController : ApiControllerBase
             ]);
         }
 
-        lock (_store.SyncRoot)
+        var user = await _db.Users.FirstOrDefaultAsync(x => x.Email == request.Email);
+        if (user is null)
         {
-            var user = _store.Users.FirstOrDefault(x => x.Email.Equals(request.Email, StringComparison.OrdinalIgnoreCase));
-            if (user is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "User not found.");
-            }
-
-            user.Password = request.NewPassword;
+            return ErrorResponse(StatusCodes.Status404NotFound, "User not found.");
         }
+
+        user.PasswordHash = request.NewPassword;
+        user.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
 
         return OkResponse(new { reset = true }, "Password reset successful");
     }
 
     [HttpPost("refresh")]
     [AllowAnonymous]
-    public IActionResult Refresh(RefreshRequest request)
+    public async Task<IActionResult> Refresh(RefreshRequest request)
     {
-        RefreshTokenRecord? refresh;
-        UserRecord? user;
+        var refresh = await _db.UserRefreshTokens
+            .Include(x => x.User)
+            .FirstOrDefaultAsync(x => x.TokenHash == request.RefreshToken);
 
-        lock (_store.SyncRoot)
+        if (refresh is null || refresh.RevokedAt.HasValue || refresh.ExpiresAt <= DateTime.UtcNow || !refresh.User.IsActive)
         {
-            refresh = _store.RefreshTokens.FirstOrDefault(x => x.Token == request.RefreshToken);
-            if (refresh is null || refresh.Revoked || refresh.ExpiresAt <= DateTime.UtcNow)
-            {
-                return ErrorResponse(StatusCodes.Status401Unauthorized, "Invalid refresh token.");
-            }
-
-            user = _store.Users.FirstOrDefault(x => x.Id == refresh.UserId && x.Active);
-            if (user is null)
-            {
-                return ErrorResponse(StatusCodes.Status401Unauthorized, "Invalid refresh token.");
-            }
-
-            refresh.Revoked = true;
+            return ErrorResponse(StatusCodes.Status401Unauthorized, "Invalid refresh token.");
         }
 
-        var accessToken = CreateAccessToken(user);
+        refresh.RevokedAt = DateTime.UtcNow;
+
+        var accessToken = CreateAccessToken(refresh.User);
         var newRefreshToken = CreateRefreshToken();
         var expiresInSeconds = _jwtSettings.AccessTokenExpiryMinutes * 60;
 
-        lock (_store.SyncRoot)
+        _db.UserRefreshTokens.Add(new UserRefreshToken
         {
-            _store.RefreshTokens.Add(new RefreshTokenRecord
-            {
-                Token = newRefreshToken,
-                UserId = user.Id,
-                ExpiresAt = DateTime.UtcNow.AddDays(_jwtSettings.RefreshTokenExpiryDays),
-                Revoked = false
-            });
-        }
+            UserId = refresh.UserId,
+            TokenHash = newRefreshToken,
+            ExpiresAt = DateTime.UtcNow.AddDays(_jwtSettings.RefreshTokenExpiryDays)
+        });
+
+        await _db.SaveChangesAsync();
 
         return OkResponse(new
         {
@@ -209,17 +203,17 @@ public class AuthController : ApiControllerBase
             expiresInSeconds,
             user = new
             {
-                id = user.Id,
-                name = user.Name,
-                email = user.Email,
-                role = user.Role
+                id = refresh.User.UserId,
+                name = refresh.User.FullName,
+                email = refresh.User.Email,
+                role = refresh.User.RoleCode
             }
         }, "Token refreshed");
     }
 
     [HttpPost("logout")]
     [Authorize]
-    public IActionResult Logout()
+    public async Task<IActionResult> Logout()
     {
         var userId = User.GetUserId();
         if (string.IsNullOrWhiteSpace(userId))
@@ -227,20 +221,23 @@ public class AuthController : ApiControllerBase
             return ErrorResponse(StatusCodes.Status401Unauthorized, "Unauthorized");
         }
 
-        lock (_store.SyncRoot)
+        var tokens = await _db.UserRefreshTokens
+            .Where(x => x.UserId == userId && !x.RevokedAt.HasValue)
+            .ToListAsync();
+
+        foreach (var token in tokens)
         {
-            foreach (var token in _store.RefreshTokens.Where(x => x.UserId == userId && !x.Revoked))
-            {
-                token.Revoked = true;
-            }
+            token.RevokedAt = DateTime.UtcNow;
         }
+
+        await _db.SaveChangesAsync();
 
         return OkResponse(new { loggedOut = true }, "Logout successful");
     }
 
     [HttpGet("me")]
     [Authorize]
-    public IActionResult Me()
+    public async Task<IActionResult> Me()
     {
         var userId = User.GetUserId();
         if (string.IsNullOrWhiteSpace(userId))
@@ -248,35 +245,32 @@ public class AuthController : ApiControllerBase
             return ErrorResponse(StatusCodes.Status401Unauthorized, "Unauthorized");
         }
 
-        lock (_store.SyncRoot)
+        var user = await _db.Users.FirstOrDefaultAsync(x => x.UserId == userId && x.IsActive);
+        if (user is null)
         {
-            var user = _store.Users.FirstOrDefault(x => x.Id == userId && x.Active);
-            if (user is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "User not found");
-            }
-
-            return OkResponse(new
-            {
-                id = user.Id,
-                name = user.Name,
-                email = user.Email,
-                role = user.Role
-            });
+            return ErrorResponse(StatusCodes.Status404NotFound, "User not found");
         }
+
+        return OkResponse(new
+        {
+            id = user.UserId,
+            name = user.FullName,
+            email = user.Email,
+            role = user.RoleCode
+        });
     }
 
-    private string CreateAccessToken(UserRecord user)
+    private string CreateAccessToken(User user)
     {
         var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtSettings.SecretKey));
         var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
         var claims = new List<Claim>
         {
-            new(ClaimTypes.NameIdentifier, user.Id),
-            new(ClaimTypes.Name, user.Name),
+            new(ClaimTypes.NameIdentifier, user.UserId),
+            new(ClaimTypes.Name, user.FullName),
             new(ClaimTypes.Email, user.Email),
-            new(ClaimTypes.Role, user.Role)
+            new(ClaimTypes.Role, user.RoleCode)
         };
 
         var token = new JwtSecurityToken(

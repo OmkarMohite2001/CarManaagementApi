@@ -1,10 +1,11 @@
 using System.Text.RegularExpressions;
 using CarManaagementApi.Contracts;
-using CarManaagementApi.Services;
-using CarManaagementApi.Services.Models;
+using CarManaagementApi.Persistence;
+using CarManaagementApi.Persistence.Entities;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace CarManaagementApi.Controllers;
 
@@ -16,71 +17,69 @@ public class CustomersController : ApiControllerBase
     private static readonly Regex PhoneRegex = new("^[6-9]\\d{9}$", RegexOptions.Compiled);
     private static readonly Regex PincodeRegex = new("^\\d{6}$", RegexOptions.Compiled);
 
-    private readonly IRentXStore _store;
+    private readonly RentXDbContext _db;
 
-    public CustomersController(IRentXStore store)
+    public CustomersController(RentXDbContext db)
     {
-        _store = store;
+        _db = db;
     }
 
     [HttpGet]
-    public IActionResult GetCustomers(
+    public async Task<IActionResult> GetCustomers(
         [FromQuery] string? q,
         [FromQuery] string? type,
         [FromQuery] string? city,
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 20)
     {
-        lock (_store.SyncRoot)
+        var query = _db.Customers.AsNoTracking().AsQueryable();
+
+        if (!string.IsNullOrWhiteSpace(q))
         {
-            var query = _store.Customers.AsEnumerable();
-
-            if (!string.IsNullOrWhiteSpace(q))
-            {
-                query = query.Where(x =>
-                    x.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Email.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Phone.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Id.Contains(q, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (!string.IsNullOrWhiteSpace(type))
-            {
-                query = query.Where(x => x.Type.Equals(type, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (!string.IsNullOrWhiteSpace(city))
-            {
-                query = query.Where(x => x.City.Equals(city, StringComparison.OrdinalIgnoreCase));
-            }
-
-            var shaped = query
-                .OrderBy(x => x.Name)
-                .Select(x => (object)new
-                {
-                    id = x.Id,
-                    type = x.Type,
-                    name = x.Name,
-                    phone = x.Phone,
-                    email = x.Email,
-                    dob = x.Dob,
-                    kycType = x.KycType,
-                    kycNumber = x.KycNumber,
-                    dlNumber = x.DlNumber,
-                    dlExpiry = x.DlExpiry,
-                    address = x.Address,
-                    city = x.City,
-                    state = x.State,
-                    pincode = x.Pincode
-                });
-
-            var (items, meta) = shaped.Paginate(page, pageSize);
-            return OkResponse<IEnumerable<object>>(items, meta: meta);
+            query = query.Where(x =>
+                x.Name.Contains(q)
+                || (x.Email != null && x.Email.Contains(q))
+                || x.Phone.Contains(q)
+                || x.CustomerId.Contains(q));
         }
+
+        if (!string.IsNullOrWhiteSpace(type))
+        {
+            query = query.Where(x => x.CustomerType == type);
+        }
+
+        if (!string.IsNullOrWhiteSpace(city))
+        {
+            query = query.Where(x => x.City == city);
+        }
+
+        var shaped = await query
+            .OrderBy(x => x.Name)
+            .Select(x => (object)new
+            {
+                id = x.CustomerId,
+                type = x.CustomerType,
+                name = x.Name,
+                phone = x.Phone,
+                email = x.Email,
+                dob = x.Dob,
+                kycType = x.KycType,
+                kycNumber = x.KycNumber,
+                dlNumber = x.DlNumber,
+                dlExpiry = x.DlExpiry,
+                address = x.Address,
+                city = x.City,
+                state = x.State,
+                pincode = x.Pincode
+            })
+            .ToListAsync();
+
+        var (items, meta) = shaped.Paginate(page, pageSize);
+        return OkResponse<IEnumerable<object>>(items, meta: meta);
     }
 
     [HttpPost]
-    public IActionResult CreateCustomer(CustomerUpsertRequest request)
+    public async Task<IActionResult> CreateCustomer(CustomerUpsertRequest request)
     {
         var validation = ValidateCustomer(request);
         if (validation is not null)
@@ -88,37 +87,37 @@ public class CustomersController : ApiControllerBase
             return validation;
         }
 
-        lock (_store.SyncRoot)
+        var emailExists = !string.IsNullOrWhiteSpace(request.Email)
+            && await _db.Customers.AnyAsync(x => x.Email == request.Email);
+
+        if (emailExists)
         {
-            if (_store.Customers.Any(x => x.Email.Equals(request.Email, StringComparison.OrdinalIgnoreCase)))
-            {
-                return ErrorResponse(StatusCodes.Status409Conflict, "Customer email already exists");
-            }
-
-            var customer = MapToCustomer(_store.NextId("CUS"), request);
-            _store.Customers.Add(customer);
-
-            return OkResponse(ToCustomerResponse(customer), "Customer created");
+            return ErrorResponse(StatusCodes.Status409Conflict, "Customer email already exists");
         }
+
+        var customerId = await IdGenerator.NextAsync(_db.Customers.Select(x => x.CustomerId), "CUS");
+
+        var customer = MapToCustomer(customerId, request);
+        _db.Customers.Add(customer);
+        await _db.SaveChangesAsync();
+
+        return OkResponse(ToCustomerResponse(customer), "Customer created");
     }
 
     [HttpGet("{customerId}")]
-    public IActionResult GetCustomerById(string customerId)
+    public async Task<IActionResult> GetCustomerById(string customerId)
     {
-        lock (_store.SyncRoot)
+        var customer = await _db.Customers.AsNoTracking().FirstOrDefaultAsync(x => x.CustomerId == customerId);
+        if (customer is null)
         {
-            var customer = _store.Customers.FirstOrDefault(x => x.Id.Equals(customerId, StringComparison.OrdinalIgnoreCase));
-            if (customer is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Customer not found");
-            }
-
-            return OkResponse(ToCustomerResponse(customer));
+            return ErrorResponse(StatusCodes.Status404NotFound, "Customer not found");
         }
+
+        return OkResponse(ToCustomerResponse(customer));
     }
 
     [HttpPut("{customerId}")]
-    public IActionResult UpdateCustomer(string customerId, CustomerUpsertRequest request)
+    public async Task<IActionResult> UpdateCustomer(string customerId, CustomerUpsertRequest request)
     {
         var validation = ValidateCustomer(request);
         if (validation is not null)
@@ -126,53 +125,52 @@ public class CustomersController : ApiControllerBase
             return validation;
         }
 
-        lock (_store.SyncRoot)
+        var existing = await _db.Customers.FirstOrDefaultAsync(x => x.CustomerId == customerId);
+        if (existing is null)
         {
-            var existing = _store.Customers.FirstOrDefault(x => x.Id.Equals(customerId, StringComparison.OrdinalIgnoreCase));
-            if (existing is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Customer not found");
-            }
-
-            if (_store.Customers.Any(x =>
-                    !x.Id.Equals(customerId, StringComparison.OrdinalIgnoreCase)
-                    && x.Email.Equals(request.Email, StringComparison.OrdinalIgnoreCase)))
-            {
-                return ErrorResponse(StatusCodes.Status409Conflict, "Customer email already exists");
-            }
-
-            existing.Type = request.Type;
-            existing.Name = request.Name;
-            existing.Phone = request.Phone;
-            existing.Email = request.Email;
-            existing.Dob = request.Dob;
-            existing.KycType = request.KycType;
-            existing.KycNumber = request.KycNumber;
-            existing.DlNumber = request.DlNumber;
-            existing.DlExpiry = request.DlExpiry;
-            existing.Address = request.Address;
-            existing.City = request.City;
-            existing.State = request.State;
-            existing.Pincode = request.Pincode;
-
-            return OkResponse(ToCustomerResponse(existing), "Customer updated");
+            return ErrorResponse(StatusCodes.Status404NotFound, "Customer not found");
         }
+
+        var emailExists = !string.IsNullOrWhiteSpace(request.Email)
+            && await _db.Customers.AnyAsync(x => x.CustomerId != customerId && x.Email == request.Email);
+
+        if (emailExists)
+        {
+            return ErrorResponse(StatusCodes.Status409Conflict, "Customer email already exists");
+        }
+
+        existing.CustomerType = request.Type;
+        existing.Name = request.Name;
+        existing.Phone = request.Phone;
+        existing.Email = request.Email;
+        existing.Dob = request.Dob;
+        existing.KycType = request.KycType;
+        existing.KycNumber = request.KycNumber;
+        existing.DlNumber = request.DlNumber;
+        existing.DlExpiry = request.DlExpiry;
+        existing.Address = request.Address;
+        existing.City = request.City;
+        existing.State = request.State;
+        existing.Pincode = request.Pincode;
+        existing.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+
+        return OkResponse(ToCustomerResponse(existing), "Customer updated");
     }
 
     [HttpDelete("{customerId}")]
-    public IActionResult DeleteCustomer(string customerId)
+    public async Task<IActionResult> DeleteCustomer(string customerId)
     {
-        lock (_store.SyncRoot)
+        var customer = await _db.Customers.FirstOrDefaultAsync(x => x.CustomerId == customerId);
+        if (customer is null)
         {
-            var customer = _store.Customers.FirstOrDefault(x => x.Id.Equals(customerId, StringComparison.OrdinalIgnoreCase));
-            if (customer is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Customer not found");
-            }
-
-            _store.Customers.Remove(customer);
-            return NoContent();
+            return ErrorResponse(StatusCodes.Status404NotFound, "Customer not found");
         }
+
+        _db.Customers.Remove(customer);
+        await _db.SaveChangesAsync();
+        return NoContent();
     }
 
     private IActionResult? ValidateCustomer(CustomerUpsertRequest request)
@@ -184,7 +182,7 @@ public class CustomersController : ApiControllerBase
             errors.Add(new ApiErrorItem { Field = "phone", Code = "InvalidPhone", Message = "Phone must match ^[6-9]\\d{9}$." });
         }
 
-        if (!PincodeRegex.IsMatch(request.Pincode))
+        if (!PincodeRegex.IsMatch(request.Pincode ?? string.Empty))
         {
             errors.Add(new ApiErrorItem { Field = "pincode", Code = "InvalidPincode", Message = "Pincode must be 6 digits." });
         }
@@ -221,12 +219,12 @@ public class CustomersController : ApiControllerBase
         return null;
     }
 
-    private static CustomerRecord MapToCustomer(string id, CustomerUpsertRequest request)
+    private static Customer MapToCustomer(string id, CustomerUpsertRequest request)
     {
-        return new CustomerRecord
+        return new Customer
         {
-            Id = id,
-            Type = request.Type,
+            CustomerId = id,
+            CustomerType = request.Type,
             Name = request.Name,
             Phone = request.Phone,
             Email = request.Email,
@@ -238,16 +236,17 @@ public class CustomersController : ApiControllerBase
             Address = request.Address,
             City = request.City,
             State = request.State,
-            Pincode = request.Pincode
+            Pincode = request.Pincode,
+            CreatedAt = DateTime.UtcNow
         };
     }
 
-    private static object ToCustomerResponse(CustomerRecord x)
+    private static object ToCustomerResponse(Customer x)
     {
         return new
         {
-            id = x.Id,
-            type = x.Type,
+            id = x.CustomerId,
+            type = x.CustomerType,
             name = x.Name,
             phone = x.Phone,
             email = x.Email,
@@ -268,15 +267,15 @@ public class CustomersController : ApiControllerBase
         public string Type { get; set; } = "individual";
         public string Name { get; set; } = string.Empty;
         public string Phone { get; set; } = string.Empty;
-        public string Email { get; set; } = string.Empty;
+        public string? Email { get; set; }
         public DateOnly? Dob { get; set; }
         public string KycType { get; set; } = string.Empty;
         public string KycNumber { get; set; } = string.Empty;
         public string? DlNumber { get; set; }
         public DateOnly? DlExpiry { get; set; }
-        public string Address { get; set; } = string.Empty;
-        public string City { get; set; } = string.Empty;
-        public string State { get; set; } = string.Empty;
-        public string Pincode { get; set; } = string.Empty;
+        public string? Address { get; set; }
+        public string? City { get; set; }
+        public string? State { get; set; }
+        public string? Pincode { get; set; }
     }
 }

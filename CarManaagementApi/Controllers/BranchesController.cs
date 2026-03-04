@@ -1,9 +1,10 @@
 using System.Text.RegularExpressions;
-using CarManaagementApi.Services;
-using CarManaagementApi.Services.Models;
+using CarManaagementApi.Persistence;
+using CarManaagementApi.Persistence.Entities;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace CarManaagementApi.Controllers;
 
@@ -15,46 +16,60 @@ public class BranchesController : ApiControllerBase
     private static readonly Regex IdRegex = new("^[A-Z0-9]{2,6}$", RegexOptions.Compiled);
     private static readonly Regex PincodeRegex = new("^\\d{6}$", RegexOptions.Compiled);
 
-    private readonly IRentXStore _store;
+    private readonly RentXDbContext _db;
 
-    public BranchesController(IRentXStore store)
+    public BranchesController(RentXDbContext db)
     {
-        _store = store;
+        _db = db;
     }
 
     [HttpGet]
-    public IActionResult GetBranches(
+    public async Task<IActionResult> GetBranches(
         [FromQuery] string? q,
         [FromQuery] bool? active,
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 20)
     {
-        lock (_store.SyncRoot)
+        var query = _db.Branches.AsNoTracking().AsQueryable();
+
+        if (!string.IsNullOrWhiteSpace(q))
         {
-            var query = _store.Branches.AsEnumerable();
-
-            if (!string.IsNullOrWhiteSpace(q))
-            {
-                query = query.Where(x =>
-                    x.Id.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.City.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    || x.Email.Contains(q, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (active.HasValue)
-            {
-                query = query.Where(x => x.Active == active.Value);
-            }
-
-            var shaped = query.OrderBy(x => x.Name).Select(ToResponse);
-            var (items, meta) = shaped.Paginate(page, pageSize);
-            return OkResponse<IEnumerable<object>>(items, meta: meta);
+            query = query.Where(x =>
+                x.BranchId.Contains(q)
+                || x.Name.Contains(q)
+                || (x.City != null && x.City.Contains(q))
+                || (x.Email != null && x.Email.Contains(q)));
         }
+
+        if (active.HasValue)
+        {
+            query = query.Where(x => x.IsActive == active.Value);
+        }
+
+        var rows = await query
+            .OrderBy(x => x.Name)
+            .Select(x => (object)new
+            {
+                id = x.BranchId,
+                name = x.Name,
+                phone = x.Phone,
+                email = x.Email,
+                address = x.Address,
+                city = x.City,
+                state = x.State,
+                pincode = x.Pincode,
+                openAt = x.OpenAt.ToString("HH:mm"),
+                closeAt = x.CloseAt.ToString("HH:mm"),
+                active = x.IsActive
+            })
+            .ToListAsync();
+
+        var (items, meta) = rows.Paginate(page, pageSize);
+        return OkResponse<IEnumerable<object>>(items, meta: meta);
     }
 
     [HttpPost]
-    public IActionResult CreateBranch(BranchUpsertRequest request)
+    public async Task<IActionResult> CreateBranch(BranchUpsertRequest request)
     {
         var validation = ValidateBranch(request, true);
         if (validation is not null)
@@ -62,21 +77,20 @@ public class BranchesController : ApiControllerBase
             return validation;
         }
 
-        lock (_store.SyncRoot)
+        var exists = await _db.Branches.AnyAsync(x => x.BranchId == request.Id);
+        if (exists)
         {
-            if (_store.Branches.Any(x => x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase)))
-            {
-                return ErrorResponse(StatusCodes.Status409Conflict, "Branch id already exists");
-            }
-
-            var branch = MapBranch(request);
-            _store.Branches.Add(branch);
-            return OkResponse(ToResponse(branch), "Branch created");
+            return ErrorResponse(StatusCodes.Status409Conflict, "Branch id already exists");
         }
+
+        var branch = MapBranch(request);
+        _db.Branches.Add(branch);
+        await _db.SaveChangesAsync();
+        return OkResponse(ToResponse(branch), "Branch created");
     }
 
     [HttpPut("{branchId}")]
-    public IActionResult UpdateBranch(string branchId, BranchUpsertRequest request)
+    public async Task<IActionResult> UpdateBranch(string branchId, BranchUpsertRequest request)
     {
         var validation = ValidateBranch(request, false);
         if (validation is not null)
@@ -84,59 +98,57 @@ public class BranchesController : ApiControllerBase
             return validation;
         }
 
-        lock (_store.SyncRoot)
+        var existing = await _db.Branches.FirstOrDefaultAsync(x => x.BranchId == branchId);
+        if (existing is null)
         {
-            var existing = _store.Branches.FirstOrDefault(x => x.Id.Equals(branchId, StringComparison.OrdinalIgnoreCase));
-            if (existing is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Branch not found");
-            }
-
-            existing.Name = request.Name;
-            existing.Phone = request.Phone;
-            existing.Email = request.Email;
-            existing.Address = request.Address;
-            existing.City = request.City;
-            existing.State = request.State;
-            existing.Pincode = request.Pincode;
-            existing.OpenAt = request.OpenAt;
-            existing.CloseAt = request.CloseAt;
-            existing.Active = request.Active;
-
-            return OkResponse(ToResponse(existing), "Branch updated");
+            return ErrorResponse(StatusCodes.Status404NotFound, "Branch not found");
         }
+
+        existing.Name = request.Name;
+        existing.Phone = request.Phone;
+        existing.Email = request.Email;
+        existing.Address = request.Address;
+        existing.City = request.City;
+        existing.State = request.State;
+        existing.Pincode = request.Pincode;
+        existing.OpenAt = request.OpenAt;
+        existing.CloseAt = request.CloseAt;
+        existing.IsActive = request.Active;
+        existing.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+
+        return OkResponse(ToResponse(existing), "Branch updated");
     }
 
     [HttpPatch("{branchId}/active")]
-    public IActionResult PatchActive(string branchId, BranchActiveRequest request)
+    public async Task<IActionResult> PatchActive(string branchId, BranchActiveRequest request)
     {
-        lock (_store.SyncRoot)
+        var existing = await _db.Branches.FirstOrDefaultAsync(x => x.BranchId == branchId);
+        if (existing is null)
         {
-            var existing = _store.Branches.FirstOrDefault(x => x.Id.Equals(branchId, StringComparison.OrdinalIgnoreCase));
-            if (existing is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Branch not found");
-            }
-
-            existing.Active = request.Active;
-            return OkResponse(new { id = existing.Id, active = existing.Active }, "Branch active status updated");
+            return ErrorResponse(StatusCodes.Status404NotFound, "Branch not found");
         }
+
+        existing.IsActive = request.Active;
+        existing.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+
+        return OkResponse(new { id = existing.BranchId, active = existing.IsActive }, "Branch active status updated");
     }
 
     [HttpDelete("{branchId}")]
-    public IActionResult DeleteBranch(string branchId)
+    public async Task<IActionResult> DeleteBranch(string branchId)
     {
-        lock (_store.SyncRoot)
+        var existing = await _db.Branches.FirstOrDefaultAsync(x => x.BranchId == branchId);
+        if (existing is null)
         {
-            var existing = _store.Branches.FirstOrDefault(x => x.Id.Equals(branchId, StringComparison.OrdinalIgnoreCase));
-            if (existing is null)
-            {
-                return ErrorResponse(StatusCodes.Status404NotFound, "Branch not found");
-            }
-
-            _store.Branches.Remove(existing);
-            return NoContent();
+            return ErrorResponse(StatusCodes.Status404NotFound, "Branch not found");
         }
+
+        _db.Branches.Remove(existing);
+        await _db.SaveChangesAsync();
+        return NoContent();
     }
 
     private IActionResult? ValidateBranch(BranchUpsertRequest request, bool idRequired)
@@ -166,11 +178,11 @@ public class BranchesController : ApiControllerBase
         return null;
     }
 
-    private static BranchRecord MapBranch(BranchUpsertRequest request)
+    private static Branch MapBranch(BranchUpsertRequest request)
     {
-        return new BranchRecord
+        return new Branch
         {
-            Id = request.Id,
+            BranchId = request.Id,
             Name = request.Name,
             Phone = request.Phone,
             Email = request.Email,
@@ -180,15 +192,16 @@ public class BranchesController : ApiControllerBase
             Pincode = request.Pincode,
             OpenAt = request.OpenAt,
             CloseAt = request.CloseAt,
-            Active = request.Active
+            IsActive = request.Active,
+            CreatedAt = DateTime.UtcNow
         };
     }
 
-    private static object ToResponse(BranchRecord x)
+    private static object ToResponse(Branch x)
     {
         return new
         {
-            id = x.Id,
+            id = x.BranchId,
             name = x.Name,
             phone = x.Phone,
             email = x.Email,
@@ -198,7 +211,7 @@ public class BranchesController : ApiControllerBase
             pincode = x.Pincode,
             openAt = x.OpenAt.ToString("HH:mm"),
             closeAt = x.CloseAt.ToString("HH:mm"),
-            active = x.Active
+            active = x.IsActive
         };
     }
 
@@ -206,12 +219,12 @@ public class BranchesController : ApiControllerBase
     {
         public string Id { get; set; } = string.Empty;
         public string Name { get; set; } = string.Empty;
-        public string Phone { get; set; } = string.Empty;
-        public string Email { get; set; } = string.Empty;
-        public string Address { get; set; } = string.Empty;
-        public string City { get; set; } = string.Empty;
-        public string State { get; set; } = string.Empty;
-        public string Pincode { get; set; } = string.Empty;
+        public string? Phone { get; set; }
+        public string? Email { get; set; }
+        public string? Address { get; set; }
+        public string? City { get; set; }
+        public string? State { get; set; }
+        public string? Pincode { get; set; }
         public TimeOnly OpenAt { get; set; }
         public TimeOnly CloseAt { get; set; }
         public bool Active { get; set; }
