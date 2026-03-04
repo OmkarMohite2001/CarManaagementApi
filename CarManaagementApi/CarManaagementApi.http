@@ -1,6 +1,43 @@
 @CarManaagementApi_HostAddress = http://localhost:5233
+@AuthToken = replace-with-token
 
-GET {{CarManaagementApi_HostAddress}}/weatherforecast/
-Accept: application/json
+### Login
+POST {{CarManaagementApi_HostAddress}}/api/v1/auth/login
+Content-Type: application/json
 
-###
+{
+  "usernameOrEmail": "admin",
+  "password": "admin",
+  "rememberMe": true
+}
+
+### Auth Me
+GET {{CarManaagementApi_HostAddress}}/api/v1/auth/me
+Authorization: Bearer {{AuthToken}}
+
+### Lookups Enums
+GET {{CarManaagementApi_HostAddress}}/api/v1/lookups/enums
+Authorization: Bearer {{AuthToken}}
+
+### Cars Browse
+GET {{CarManaagementApi_HostAddress}}/api/v1/cars?page=1&pageSize=20
+Authorization: Bearer {{AuthToken}}
+
+### Create Booking
+POST {{CarManaagementApi_HostAddress}}/api/v1/bookings
+Authorization: Bearer {{AuthToken}}
+Content-Type: application/json
+
+{
+  "customerId": "CUS-1001",
+  "carId": "CAR-1001",
+  "locationCode": "PNQ",
+  "pickAt": "2026-03-10T10:00:00Z",
+  "dropAt": "2026-03-12T10:00:00Z",
+  "dailyPrice": 2700,
+  "notes": "Airport pickup"
+}
+
+### Dashboard Summary
+GET {{CarManaagementApi_HostAddress}}/api/v1/dashboard/summary
+Authorization: Bearer {{AuthToken}}
