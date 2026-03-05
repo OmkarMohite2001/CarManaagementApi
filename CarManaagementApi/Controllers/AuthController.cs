@@ -1,9 +1,11 @@
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 using CarManaagementApi.Contracts;
 using CarManaagementApi.Persistence;
 using CarManaagementApi.Persistence.Entities;
+using CarManaagementApi.Services;
 using CarManaagementApi.Shared;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -19,11 +21,22 @@ public class AuthController : ApiControllerBase
 {
     private readonly RentXDbContext _db;
     private readonly JwtSettings _jwtSettings;
+    private readonly EmailVerificationSettings _emailVerificationSettings;
+    private readonly IEmailSender _emailSender;
+    private readonly IWebHostEnvironment _environment;
 
-    public AuthController(RentXDbContext db, IOptions<JwtSettings> jwtOptions)
+    public AuthController(
+        RentXDbContext db,
+        IOptions<JwtSettings> jwtOptions,
+        IOptions<EmailVerificationSettings> emailVerificationOptions,
+        IEmailSender emailSender,
+        IWebHostEnvironment environment)
     {
         _db = db;
         _jwtSettings = jwtOptions.Value;
+        _emailVerificationSettings = emailVerificationOptions.Value;
+        _emailSender = emailSender;
+        _environment = environment;
     }
 
     [HttpPost("login")]
@@ -40,7 +53,15 @@ public class AuthController : ApiControllerBase
             return ErrorResponse(StatusCodes.Status401Unauthorized, "Invalid username/email or password.");
         }
 
-        user.LastLoginAt = DateTime.UtcNow;
+        if (!user.IsEmailVerified)
+        {
+            return ErrorResponse(StatusCodes.Status403Forbidden, "Email not verified. Please verify your email before login.");
+        }
+
+        var now = DateTime.UtcNow;
+        var clientIp = GetClientIp();
+        var userAgent = GetUserAgent();
+        user.LastLoginAt = now;
 
         var expiresInSeconds = _jwtSettings.AccessTokenExpiryMinutes * 60;
         var accessToken = CreateAccessToken(user);
@@ -54,7 +75,18 @@ public class AuthController : ApiControllerBase
         {
             UserId = user.UserId,
             TokenHash = refreshToken,
-            ExpiresAt = DateTime.UtcNow.AddDays(refreshExpiryDays)
+            ExpiresAt = now.AddDays(refreshExpiryDays)
+        });
+
+        _db.UserAuthLogs.Add(new UserAuthLog
+        {
+            UserId = user.UserId,
+            RoleCode = user.RoleCode,
+            LoginAt = now,
+            LoginIp = clientIp,
+            UserAgent = userAgent,
+            Source = "web",
+            CreatedAt = now
         });
 
         await _db.SaveChangesAsync();
@@ -121,19 +153,169 @@ public class AuthController : ApiControllerBase
             RoleCode = "viewer",
             PasswordHash = request.Password,
             IsActive = true,
+            IsEmailVerified = false,
             CreatedAt = DateTime.UtcNow
         };
 
         _db.Users.Add(user);
         await _db.SaveChangesAsync();
 
-        return OkResponse(new
+        string verificationCode;
+        try
         {
-            id = user.UserId,
-            fullName = user.FullName,
-            email = user.Email,
-            role = user.RoleCode
-        }, "Registration successful");
+            verificationCode = await CreateAndSendVerificationCodeAsync(user);
+        }
+        catch
+        {
+            return ErrorResponse(StatusCodes.Status500InternalServerError, "Account created, but failed to send verification email.");
+        }
+
+        var response = new Dictionary<string, object?>
+        {
+            ["id"] = user.UserId,
+            ["fullName"] = user.FullName,
+            ["email"] = user.Email,
+            ["role"] = user.RoleCode,
+            ["emailVerified"] = user.IsEmailVerified,
+            ["verificationSent"] = true
+        };
+
+        if (ShouldExposeVerificationCode())
+        {
+            response["verificationCode"] = verificationCode;
+        }
+
+        return OkResponse(response, "Registration successful. Verification code sent to email.");
+    }
+
+    [HttpPost("email-verification/verify")]
+    [AllowAnonymous]
+    public async Task<IActionResult> VerifyEmail(VerifyEmailRequest request)
+    {
+        var user = await _db.Users.FirstOrDefaultAsync(x => x.Email == request.Email);
+        if (user is null)
+        {
+            return ErrorResponse(StatusCodes.Status404NotFound, "User not found.");
+        }
+
+        if (user.IsEmailVerified)
+        {
+            return OkResponse(new { email = user.Email, verified = true }, "Email already verified.");
+        }
+
+        var now = DateTime.UtcNow;
+        var maxAttempts = GetMaxVerifyAttempts();
+
+        var token = await _db.UserEmailVerifications
+            .Where(x => x.UserId == user.UserId && x.VerifiedAt == null && x.ExpiresAt > now)
+            .OrderByDescending(x => x.CreatedAt)
+            .FirstOrDefaultAsync();
+
+        if (token is null)
+        {
+            return ErrorResponse(StatusCodes.Status400BadRequest, "Invalid or expired verification code.");
+        }
+
+        if (token.FailedAttempts >= maxAttempts)
+        {
+            return ErrorResponse(StatusCodes.Status429TooManyRequests, "Maximum verification attempts reached. Please request a new code.");
+        }
+
+        var providedCode = request.Code?.Trim() ?? string.Empty;
+        if (!string.Equals(token.VerificationCode, providedCode, StringComparison.Ordinal))
+        {
+            token.FailedAttempts = (byte)Math.Min(byte.MaxValue, token.FailedAttempts + 1);
+            var remainingAttempts = Math.Max(0, maxAttempts - token.FailedAttempts);
+
+            if (remainingAttempts == 0)
+            {
+                token.ExpiresAt = now.AddSeconds(-1);
+            }
+
+            await _db.SaveChangesAsync();
+
+            if (remainingAttempts == 0)
+            {
+                return ErrorResponse(StatusCodes.Status429TooManyRequests, "Maximum verification attempts reached. Please request a new code.");
+            }
+
+            return ErrorResponse(StatusCodes.Status400BadRequest, "Invalid verification code.", [
+                new ApiErrorItem
+                {
+                    Field = "code",
+                    Code = "InvalidCode",
+                    Message = $"Invalid verification code. {remainingAttempts} attempt(s) remaining."
+                }
+            ]);
+        }
+
+        token.VerifiedAt = now;
+        user.IsEmailVerified = true;
+        user.UpdatedAt = now;
+
+        await _db.SaveChangesAsync();
+
+        return OkResponse(new { email = user.Email, verified = true }, "Email verified successfully.");
+    }
+
+    [HttpPost("email-verification/resend")]
+    [AllowAnonymous]
+    public async Task<IActionResult> ResendVerificationCode(ResendVerificationRequest request)
+    {
+        var user = await _db.Users.FirstOrDefaultAsync(x => x.Email == request.Email);
+        if (user is null)
+        {
+            return ErrorResponse(StatusCodes.Status404NotFound, "User not found.");
+        }
+
+        if (user.IsEmailVerified)
+        {
+            return ErrorResponse(StatusCodes.Status409Conflict, "Email is already verified.");
+        }
+
+        var now = DateTime.UtcNow;
+        var cooldownSeconds = GetResendCooldownSeconds();
+        var maxAttempts = GetMaxVerifyAttempts();
+        if (cooldownSeconds > 0)
+        {
+            var latestOpenCode = await _db.UserEmailVerifications
+                .Where(x => x.UserId == user.UserId && x.VerifiedAt == null && x.ExpiresAt > now)
+                .OrderByDescending(x => x.CreatedAt)
+                .FirstOrDefaultAsync();
+
+            if (latestOpenCode is not null && latestOpenCode.FailedAttempts < maxAttempts)
+            {
+                var elapsedSeconds = (int)Math.Floor((now - latestOpenCode.CreatedAt).TotalSeconds);
+                var retryAfterSeconds = cooldownSeconds - elapsedSeconds;
+                if (retryAfterSeconds > 0)
+                {
+                    return ErrorResponse(StatusCodes.Status429TooManyRequests, $"Please wait {retryAfterSeconds} seconds before requesting a new code.");
+                }
+            }
+        }
+
+        string verificationCode;
+        try
+        {
+            verificationCode = await CreateAndSendVerificationCodeAsync(user);
+        }
+        catch
+        {
+            return ErrorResponse(StatusCodes.Status500InternalServerError, "Failed to send verification email.");
+        }
+
+        var response = new Dictionary<string, object?>
+        {
+            ["email"] = user.Email,
+            ["sent"] = true
+        };
+
+        if (ShouldExposeVerificationCode())
+        {
+            response["verificationCode"] = verificationCode;
+        }
+
+        return OkResponse(response, "Verification code sent.");
     }
 
     [HttpPost("forgot-password/send-code")]
@@ -221,13 +403,26 @@ public class AuthController : ApiControllerBase
             return ErrorResponse(StatusCodes.Status401Unauthorized, "Unauthorized");
         }
 
+        var now = DateTime.UtcNow;
+        var clientIp = GetClientIp();
+
         var tokens = await _db.UserRefreshTokens
             .Where(x => x.UserId == userId && !x.RevokedAt.HasValue)
             .ToListAsync();
 
         foreach (var token in tokens)
         {
-            token.RevokedAt = DateTime.UtcNow;
+            token.RevokedAt = now;
+        }
+
+        var openLogs = await _db.UserAuthLogs
+            .Where(x => x.UserId == userId && !x.LogoutAt.HasValue)
+            .ToListAsync();
+
+        foreach (var log in openLogs)
+        {
+            log.LogoutAt = now;
+            log.LogoutIp = clientIp;
         }
 
         await _db.SaveChangesAsync();
@@ -256,7 +451,8 @@ public class AuthController : ApiControllerBase
             id = user.UserId,
             name = user.FullName,
             email = user.Email,
-            role = user.RoleCode
+            role = user.RoleCode,
+            emailVerified = user.IsEmailVerified
         });
     }
 
@@ -270,7 +466,8 @@ public class AuthController : ApiControllerBase
             new(ClaimTypes.NameIdentifier, user.UserId),
             new(ClaimTypes.Name, user.FullName),
             new(ClaimTypes.Email, user.Email),
-            new(ClaimTypes.Role, user.RoleCode)
+            new(ClaimTypes.Role, user.RoleCode),
+            new("email_verified", user.IsEmailVerified ? "true" : "false")
         };
 
         var token = new JwtSecurityToken(
@@ -283,9 +480,91 @@ public class AuthController : ApiControllerBase
         return new JwtSecurityTokenHandler().WriteToken(token);
     }
 
+    private async Task<string> CreateAndSendVerificationCodeAsync(User user)
+    {
+        var now = DateTime.UtcNow;
+        var codeExpiryMinutes = GetCodeExpiryMinutes();
+        var openTokens = await _db.UserEmailVerifications
+            .Where(x => x.UserId == user.UserId && x.VerifiedAt == null && x.ExpiresAt > now)
+            .ToListAsync();
+
+        foreach (var token in openTokens)
+        {
+            token.ExpiresAt = now;
+        }
+
+        var code = GenerateVerificationCode();
+        _db.UserEmailVerifications.Add(new UserEmailVerification
+        {
+            UserId = user.UserId,
+            VerificationCode = code,
+            ExpiresAt = now.AddMinutes(codeExpiryMinutes),
+            FailedAttempts = 0,
+            CreatedAt = now
+        });
+
+        await _db.SaveChangesAsync();
+
+        var subject = "RentX Email Verification Code";
+        var htmlBody = $"<p>Hello {user.FullName},</p><p>Your verification code is <b>{code}</b>.</p><p>This code will expire in {codeExpiryMinutes} minutes.</p>";
+
+        await _emailSender.SendEmailAsync(user.Email, subject, htmlBody);
+        return code;
+    }
+
+    private static string GenerateVerificationCode()
+    {
+        return RandomNumberGenerator.GetInt32(0, 1_000_000).ToString("D6");
+    }
+
     private static string CreateRefreshToken()
     {
         return Convert.ToBase64String(Guid.NewGuid().ToByteArray()) + Convert.ToBase64String(Guid.NewGuid().ToByteArray());
+    }
+
+    private string? GetClientIp()
+    {
+        if (Request.Headers.TryGetValue("X-Forwarded-For", out var forwardedFor) && !string.IsNullOrWhiteSpace(forwardedFor))
+        {
+            var ip = forwardedFor.ToString().Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(ip))
+            {
+                return ip;
+            }
+        }
+
+        return HttpContext.Connection.RemoteIpAddress?.ToString();
+    }
+
+    private string? GetUserAgent()
+    {
+        var userAgent = Request.Headers.UserAgent.ToString();
+        if (string.IsNullOrWhiteSpace(userAgent))
+        {
+            return null;
+        }
+
+        return userAgent.Length <= 512 ? userAgent : userAgent[..512];
+    }
+
+    private int GetCodeExpiryMinutes()
+    {
+        return Math.Clamp(_emailVerificationSettings.CodeExpiryMinutes, 1, 60);
+    }
+
+    private int GetResendCooldownSeconds()
+    {
+        return Math.Clamp(_emailVerificationSettings.ResendCooldownSeconds, 0, 300);
+    }
+
+    private byte GetMaxVerifyAttempts()
+    {
+        return (byte)Math.Clamp(_emailVerificationSettings.MaxVerifyAttempts, 1, 10);
+    }
+
+    private bool ShouldExposeVerificationCode()
+    {
+        return _environment.IsDevelopment() && _emailVerificationSettings.ExposeCodeInResponseInDevelopment;
     }
 
     public sealed class LoginRequest
@@ -301,6 +580,17 @@ public class AuthController : ApiControllerBase
         public string Email { get; set; } = string.Empty;
         public string Password { get; set; } = string.Empty;
         public string ConfirmPassword { get; set; } = string.Empty;
+    }
+
+    public sealed class VerifyEmailRequest
+    {
+        public string Email { get; set; } = string.Empty;
+        public string Code { get; set; } = string.Empty;
+    }
+
+    public sealed class ResendVerificationRequest
+    {
+        public string Email { get; set; } = string.Empty;
     }
 
     public sealed class ForgotPasswordCodeRequest

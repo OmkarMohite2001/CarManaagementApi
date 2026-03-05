@@ -45,12 +45,24 @@ BEGIN
         Phone VARCHAR(15) NULL,
         RoleCode VARCHAR(20) NOT NULL,
         PasswordHash NVARCHAR(512) NOT NULL,
+        IsEmailVerified BIT NOT NULL CONSTRAINT DF_Users_IsEmailVerified DEFAULT (0),
         IsActive BIT NOT NULL CONSTRAINT DF_Users_IsActive DEFAULT (1),
         CreatedAt DATETIME2(0) NOT NULL CONSTRAINT DF_Users_CreatedAt DEFAULT (SYSUTCDATETIME()),
         UpdatedAt DATETIME2(0) NULL,
         LastLoginAt DATETIME2(0) NULL,
         CONSTRAINT FK_Users_Roles FOREIGN KEY (RoleCode) REFERENCES rentx.Roles(RoleCode)
     );
+END
+GO
+
+IF COL_LENGTH('rentx.Users', 'IsEmailVerified') IS NULL
+BEGIN
+    ALTER TABLE rentx.Users
+    ADD IsEmailVerified BIT NOT NULL CONSTRAINT DF_Users_IsEmailVerified DEFAULT (0);
+
+    -- Backward compatibility: existing users were created before email-verification feature.
+    UPDATE rentx.Users
+    SET IsEmailVerified = 1;
 END
 GO
 
@@ -84,6 +96,66 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'rentx.UserRefreshTokens') AND name = N'UX_UserRefreshTokens_TokenHash')
 BEGIN
     CREATE UNIQUE INDEX UX_UserRefreshTokens_TokenHash ON rentx.UserRefreshTokens(TokenHash);
+END
+GO
+
+IF OBJECT_ID(N'rentx.UserAuthLogs', N'U') IS NULL
+BEGIN
+    CREATE TABLE rentx.UserAuthLogs
+    (
+        AuthLogId BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        UserId VARCHAR(20) NOT NULL,
+        RoleCode VARCHAR(20) NOT NULL,
+        LoginAt DATETIME2(0) NOT NULL,
+        LogoutAt DATETIME2(0) NULL,
+        LoginIp VARCHAR(64) NULL,
+        LogoutIp VARCHAR(64) NULL,
+        UserAgent NVARCHAR(512) NULL,
+        Source VARCHAR(30) NOT NULL CONSTRAINT DF_UserAuthLogs_Source DEFAULT ('web'),
+        CreatedAt DATETIME2(0) NOT NULL CONSTRAINT DF_UserAuthLogs_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CONSTRAINT FK_UserAuthLogs_Users FOREIGN KEY (UserId) REFERENCES rentx.Users(UserId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'rentx.UserAuthLogs') AND name = N'IX_UserAuthLogs_User_LoginAt')
+BEGIN
+    CREATE INDEX IX_UserAuthLogs_User_LoginAt ON rentx.UserAuthLogs(UserId, LoginAt DESC);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'rentx.UserAuthLogs') AND name = N'IX_UserAuthLogs_Role')
+BEGIN
+    CREATE INDEX IX_UserAuthLogs_Role ON rentx.UserAuthLogs(RoleCode);
+END
+GO
+
+IF OBJECT_ID(N'rentx.UserEmailVerifications', N'U') IS NULL
+BEGIN
+    CREATE TABLE rentx.UserEmailVerifications
+    (
+        VerificationId BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        UserId VARCHAR(20) NOT NULL,
+        VerificationCode VARCHAR(10) NOT NULL,
+        ExpiresAt DATETIME2(0) NOT NULL,
+        FailedAttempts TINYINT NOT NULL CONSTRAINT DF_UserEmailVerifications_FailedAttempts DEFAULT (0),
+        CreatedAt DATETIME2(0) NOT NULL CONSTRAINT DF_UserEmailVerifications_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        VerifiedAt DATETIME2(0) NULL,
+        CONSTRAINT FK_UserEmailVerifications_Users FOREIGN KEY (UserId) REFERENCES rentx.Users(UserId)
+    );
+END
+GO
+
+IF COL_LENGTH('rentx.UserEmailVerifications', 'FailedAttempts') IS NULL
+BEGIN
+    ALTER TABLE rentx.UserEmailVerifications
+    ADD FailedAttempts TINYINT NOT NULL CONSTRAINT DF_UserEmailVerifications_FailedAttempts DEFAULT (0);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'rentx.UserEmailVerifications') AND name = N'IX_UserEmailVerifications_User_Code')
+BEGIN
+    CREATE INDEX IX_UserEmailVerifications_User_Code ON rentx.UserEmailVerifications(UserId, VerificationCode);
 END
 GO
 
@@ -454,17 +526,17 @@ GO
 IF NOT EXISTS (SELECT 1 FROM rentx.Users WHERE UserId = 'U-1004')
 BEGIN
     INSERT INTO rentx.Users
-    (UserId, Username, FullName, Email, Phone, RoleCode, PasswordHash, IsActive)
+    (UserId, Username, FullName, Email, Phone, RoleCode, PasswordHash, IsEmailVerified, IsActive)
     VALUES
-    ('U-1004', 'admin', N'Admin User', 'admin@demo.com', '9876543210', 'admin', 'admin', 1);
+    ('U-1004', 'admin', N'Admin User', 'admin@demo.com', '9876543210', 'admin', 'admin', 1, 1);
 END
 
 IF NOT EXISTS (SELECT 1 FROM rentx.Users WHERE UserId = 'U-1005')
 BEGIN
     INSERT INTO rentx.Users
-    (UserId, Username, FullName, Email, Phone, RoleCode, PasswordHash, IsActive)
+    (UserId, Username, FullName, Email, Phone, RoleCode, PasswordHash, IsEmailVerified, IsActive)
     VALUES
-    ('U-1005', 'opslead', N'Ops Lead', 'ops@company.com', '9765432109', 'ops', 'Temp@123', 1);
+    ('U-1005', 'opslead', N'Ops Lead', 'ops@company.com', '9765432109', 'ops', 'Temp@123', 1, 1);
 END
 GO
 

@@ -71,6 +71,62 @@ public class UsersController : ApiControllerBase
         return OkResponse<IEnumerable<object>>(items, meta: meta);
     }
 
+    [HttpGet("login-activity")]
+    public async Task<IActionResult> GetLoginActivity(
+        [FromQuery] string? userId,
+        [FromQuery] string? role,
+        [FromQuery] DateTime? from,
+        [FromQuery] DateTime? to,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20)
+    {
+        var query = _db.UserAuthLogs
+            .AsNoTracking()
+            .Include(x => x.User)
+            .AsQueryable();
+
+        if (!string.IsNullOrWhiteSpace(userId))
+        {
+            query = query.Where(x => x.UserId == userId);
+        }
+
+        if (!string.IsNullOrWhiteSpace(role))
+        {
+            query = query.Where(x => x.RoleCode == role);
+        }
+
+        if (from.HasValue)
+        {
+            query = query.Where(x => x.LoginAt >= from.Value);
+        }
+
+        if (to.HasValue)
+        {
+            query = query.Where(x => x.LoginAt <= to.Value);
+        }
+
+        var rows = await query
+            .OrderByDescending(x => x.LoginAt)
+            .Select(x => (object)new
+            {
+                id = x.AuthLogId,
+                userId = x.UserId,
+                name = x.User.FullName,
+                email = x.User.Email,
+                role = x.RoleCode,
+                loginAt = x.LoginAt,
+                logoutAt = x.LogoutAt,
+                loginIp = x.LoginIp,
+                logoutIp = x.LogoutIp,
+                userAgent = x.UserAgent,
+                source = x.Source
+            })
+            .ToListAsync();
+
+        var (items, meta) = rows.Paginate(page, pageSize);
+        return OkResponse<IEnumerable<object>>(items, meta: meta);
+    }
+
     [HttpPost]
     public async Task<IActionResult> CreateUser(CreateUserRequest request)
     {

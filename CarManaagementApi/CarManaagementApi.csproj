@@ -4,6 +4,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>carmanaagementapi-5f9f3cf1-4d58-4d22-9548-8f8b9fa9e6f7</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>

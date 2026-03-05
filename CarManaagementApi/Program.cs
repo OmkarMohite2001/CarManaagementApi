@@ -2,6 +2,7 @@ using System.Text;
 using CarManaagementApi.Contracts;
 using CarManaagementApi.Data;
 using CarManaagementApi.Persistence;
+using CarManaagementApi.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
@@ -9,15 +10,34 @@ using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 var jwtSettings = builder.Configuration.GetSection("Jwt").Get<JwtSettings>() ?? new JwtSettings();
+const string LocalFrontendCorsPolicy = "LocalFrontendCorsPolicy";
 
 // Add services to the container.
 
 builder.Services.AddControllers();
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(LocalFrontendCorsPolicy, policy =>
+    {
+        policy.WithOrigins(
+                "http://localhost:4200",
+                "https://localhost:4200",
+                "http://localhost:5200",
+                "https://localhost:5200",
+                "http://localhost:5000",
+                "https://localhost:5000")
+            .AllowAnyHeader()
+            .AllowAnyMethod();
+    });
+});
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
 builder.Services.AddDbContext<RentXDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
 builder.Services.Configure<JwtSettings>(builder.Configuration.GetSection("Jwt"));
+builder.Services.Configure<SmtpSettings>(builder.Configuration.GetSection("Smtp"));
+builder.Services.Configure<EmailVerificationSettings>(builder.Configuration.GetSection("EmailVerification"));
+builder.Services.AddTransient<IEmailSender, SmtpEmailSender>();
 
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -84,6 +104,7 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
+app.UseCors(LocalFrontendCorsPolicy);
 app.UseAuthentication();
 app.UseAuthorization();
 

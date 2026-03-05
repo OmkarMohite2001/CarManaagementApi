@@ -10,10 +10,11 @@
 using System;
 using System.Reflection;
 
+[assembly: Microsoft.Extensions.Configuration.UserSecrets.UserSecretsIdAttribute("carmanaagementapi-5f9f3cf1-4d58-4d22-9548-8f8b9fa9e6f7")]
 [assembly: System.Reflection.AssemblyCompanyAttribute("CarManaagementApi")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+2053ca1388dd4451f8c8d4c8e80886071ed2ec46")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+8edc5d9b733cac49a2e65390e7829f5b946b8837")]
 [assembly: System.Reflection.AssemblyProductAttribute("CarManaagementApi")]
 [assembly: System.Reflection.AssemblyTitleAttribute("CarManaagementApi")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

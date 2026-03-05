@@ -242,7 +242,8 @@ public class AdminCarsController : ApiControllerBase
     }
 
     [HttpPost("{carId}/images")]
-    public async Task<IActionResult> UploadImages(string carId, [FromForm] IFormFileCollection files)
+    [Consumes("multipart/form-data")]
+    public async Task<IActionResult> UploadImages(string carId, IFormFileCollection files)
     {
         var car = await _db.Cars.FirstOrDefaultAsync(x => x.CarId == carId);
         if (car is null)
